@@ -50,3 +50,22 @@ This document records the key architectural and design decisions made throughout
 - **Alternatives Considered:**
   - Cancel-Oldest: Cancels resting order and lets aggressor continue. More complex order book mutation.
   - Reject: Rejects the incoming order before any partial fills. Cancel-Newest provides equivalent safety with simpler execution semantics.
+
+---
+
+## ADR-006: Server-Side Batching and 20Hz WebSocket Coalescing
+
+- **Context:** At 1,000+ trades/sec input, dispatching individual JSON messages per trade saturates network sockets and overwhelms browser JSON deserialization and DOM rendering.
+- **Decision:** The API layer Broadcaster buffers incoming trades and emits batched payload updates at 20Hz (`throttling_fps = 20`, 50ms interval). Each batch contains an array of recent trades for the channel.
+- **Alternatives Considered:**
+  - Raw unthrottled streaming: Triggers browser tab lockups and extreme garbage collection pressure at >=1,000 trades/sec.
+  - Client-side rate limiting only: Wastes bandwidth and keeps server busy generating thousands of WebSocket frames per second.
+
+---
+
+## ADR-007: Out-of-React-State Chart Streaming with Lightweight Charts
+
+- **Context:** Storing streaming tick data directly in React state (`useState`) triggers component tree re-renders on every incoming batch, causing perceptible UI stutter.
+- **Decision:** Drive TradingView Lightweight Charts directly via `series.update(...)` inside a `requestAnimationFrame` loop or event callback. React state is reserved strictly for UI metadata (connection badge, last price, capped trade tape).
+- **Alternatives Considered:**
+  - Full React state re-rendering: High frame drops and latency spikes during high-throughput bursts.

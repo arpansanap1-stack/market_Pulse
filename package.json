@@ -1,0 +1,15 @@
+{
+  "name": "marketpulse-root",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev:backend": "powershell -NoProfile -Command \"backend\\.venv\\Scripts\\uvicorn marketpulse.api.server:create_app --factory --host 127.0.0.1 --port 8000 --reload\"",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "dev": "concurrently -k -n \"BACKEND,FRONTEND\" -c \"cyan,magenta\" \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "test:backend": "powershell -NoProfile -Command \"backend\\.venv\\Scripts\\pytest backend/tests\"",
+    "test": "npm run test:backend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
