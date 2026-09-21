@@ -45,6 +45,12 @@ class Broadcaster:
         self._pending_trades: dict[str, list[dict[str, Any]]] = defaultdict(list)
         # Buffered bars: channel -> list of bar dicts
         self._pending_bars: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        # Buffered book deltas: channel -> list of delta dicts
+        self._pending_deltas: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        # Buffered anomalies: channel -> list of anomaly dicts
+        self._pending_anomalies: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        # Buffered market events: channel -> list of event dicts
+        self._pending_market_events: dict[str, list[dict[str, Any]]] = defaultdict(list)
         # Monotonic sequence counter per channel
         self._channel_seq: dict[str, int] = defaultdict(int)
 
@@ -102,6 +108,21 @@ class Broadcaster:
         channel = f"bars:{symbol}:{interval}"
         self._pending_bars[channel].append(bar_dict)
 
+    def push_book_delta(self, symbol: str, delta_dict: dict[str, Any]) -> None:
+        """Enqueue an L2 depth delta for dispatch on channel book:{symbol}."""
+        channel = f"book:{symbol}"
+        self._pending_deltas[channel].append(delta_dict)
+
+    def push_anomaly(self, symbol: str, anomaly_dict: dict[str, Any]) -> None:
+        """Enqueue a detected anomaly for batch dispatch on channel anomalies:{symbol}."""
+        channel = f"anomalies:{symbol}"
+        self._pending_anomalies[channel].append(anomaly_dict)
+
+    def push_market_event(self, symbol: str, event_dict: dict[str, Any]) -> None:
+        """Enqueue a market event for dispatch on channel events:market and events:{symbol}."""
+        self._pending_market_events["events:market"].append(event_dict)
+        self._pending_market_events[f"events:{symbol}"].append(event_dict)
+
     async def _run_flush_loop(self) -> None:
         """Periodic flush loop dispatching batched messages at throttling_fps."""
         while self._running:
@@ -112,15 +133,27 @@ class Broadcaster:
             await asyncio.sleep(sleep_duration)
 
     async def flush(self) -> None:
-        """Flush all pending trade and bar batches to subscribed clients."""
-        if not self._pending_trades and not self._pending_bars:
+        """Flush all pending trade, bar, book delta, anomaly, and event batches."""
+        if (
+            not self._pending_trades
+            and not self._pending_bars
+            and not self._pending_deltas
+            and not self._pending_anomalies
+            and not self._pending_market_events
+        ):
             return
 
         async with self._lock:
             trade_batches = dict(self._pending_trades)
             bar_batches = dict(self._pending_bars)
+            delta_batches = dict(self._pending_deltas)
+            anomaly_batches = dict(self._pending_anomalies)
+            market_event_batches = dict(self._pending_market_events)
             self._pending_trades.clear()
             self._pending_bars.clear()
+            self._pending_deltas.clear()
+            self._pending_anomalies.clear()
+            self._pending_market_events.clear()
 
         epoch_ms = int(time.time() * 1000)
 
@@ -168,6 +201,78 @@ class Broadcaster:
                 "ts": epoch_ms,
                 "data": {
                     "bars": bars,
+                },
+            }
+            self._send_to_subscribers(subscribers, json.dumps(envelope))
+
+        # 3. Flush book delta batches
+        for channel, deltas in delta_batches.items():
+            if not deltas:
+                continue
+
+            subscribers = self._channel_subscriptions.get(channel)
+            if not subscribers:
+                continue
+
+            self._channel_seq[channel] += 1
+            seq = self._channel_seq[channel]
+
+            envelope = {
+                "version": 1,
+                "type": "DATA",
+                "channel": channel,
+                "seq": seq,
+                "ts": epoch_ms,
+                "data": {
+                    "deltas": deltas,
+                },
+            }
+            self._send_to_subscribers(subscribers, json.dumps(envelope))
+
+        # 4. Flush anomaly batches
+        for channel, anomalies in anomaly_batches.items():
+            if not anomalies:
+                continue
+
+            subscribers = self._channel_subscriptions.get(channel)
+            if not subscribers:
+                continue
+
+            self._channel_seq[channel] += 1
+            seq = self._channel_seq[channel]
+
+            envelope = {
+                "version": 1,
+                "type": "DATA",
+                "channel": channel,
+                "seq": seq,
+                "ts": epoch_ms,
+                "data": {
+                    "anomalies": anomalies,
+                },
+            }
+            self._send_to_subscribers(subscribers, json.dumps(envelope))
+
+        # 5. Flush market event batches
+        for channel, events in market_event_batches.items():
+            if not events:
+                continue
+
+            subscribers = self._channel_subscriptions.get(channel)
+            if not subscribers:
+                continue
+
+            self._channel_seq[channel] += 1
+            seq = self._channel_seq[channel]
+
+            envelope = {
+                "version": 1,
+                "type": "DATA",
+                "channel": channel,
+                "seq": seq,
+                "ts": epoch_ms,
+                "data": {
+                    "market_events": events,
                 },
             }
             self._send_to_subscribers(subscribers, json.dumps(envelope))

@@ -3,6 +3,12 @@
 Contains zero external I/O, database, or web framework dependencies.
 """
 
+from marketpulse.core.anomaly import (
+    AnomalySeverity,
+    AnomalyType,
+    MarketAnomaly,
+    StreamingAnomalyDetector,
+)
 from marketpulse.core.clock import Clock, SimulatedClock, WallClock
 from marketpulse.core.events import (
     BookDelta,
@@ -45,27 +51,54 @@ from marketpulse.core.ohlc import (
     Bar,
     OHLCAggregator,
 )
+from marketpulse.core.orderbook import (
+    HalfBook,
+    MatchingEngine,
+    OrderBook,
+    PriceLevel,
+    RestingOrder,
+)
+from marketpulse.core.scenarios import (
+    SCENARIO_CATALOG,
+    ScenarioDefinition,
+    create_earnings_shock,
+    create_halt_event,
+    create_resume_event,
+    create_volatility_regime,
+    get_available_scenarios,
+)
 
 __all__ = [
     "INTERVAL_TO_NS",
+    "SCENARIO_CATALOG",
+    "AnomalySeverity",
+    "AnomalyType",
     "Bar",
     "BollingerBandsResult",
     "BookDelta",
     "Clock",
     "Event",
     "EventType",
+    "HalfBook",
     "MACDResult",
+    "MarketAnomaly",
     "MarketEvent",
+    "MatchingEngine",
     "OHLCAggregator",
     "OrderAccepted",
+    "OrderBook",
     "OrderCanceled",
     "OrderRejected",
     "OrderSubmitted",
     "OrderType",
+    "PriceLevel",
+    "RestingOrder",
+    "ScenarioDefinition",
     "SessionEnded",
     "SessionStarted",
     "Side",
     "SimulatedClock",
+    "StreamingAnomalyDetector",
     "StreamingBollingerBands",
     "StreamingEMA",
     "StreamingMACD",
@@ -85,4 +118,9 @@ __all__ = [
     "batch_sma",
     "batch_volume_trend",
     "batch_vwap",
+    "create_earnings_shock",
+    "create_halt_event",
+    "create_resume_event",
+    "create_volatility_regime",
+    "get_available_scenarios",
 ]

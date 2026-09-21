@@ -7,6 +7,7 @@ interface HeaderProps {
   status: ConnectionStatus;
   stats: MarketStats;
   currentTps: number;
+  isHalted?: boolean;
   onSetSimulationSpeed: (tps: number) => void;
   onResetSession: () => void;
 }
@@ -15,6 +16,7 @@ export const Header: React.FC<HeaderProps> = ({
   status,
   stats,
   currentTps,
+  isHalted = false,
   onSetSimulationSpeed,
   onResetSession,
 }) => {
@@ -40,7 +42,19 @@ export const Header: React.FC<HeaderProps> = ({
           {/* Prominent Simulated Data Badge */}
           <div className="flex items-center space-x-1.5 rounded-full border border-amber-500/30 bg-amber-500/10 px-3 py-1 text-xs font-medium text-amber-300">
             <AlertTriangle className="h-3.5 w-3.5 text-amber-400 animate-pulse" />
-            <span className="tracking-wide">SIMULATED DATA — NOT FINANCIAL ADVICE</span>
+            <span className="tracking-wide">SIMULATED DATA</span>
+          </div>
+
+          {/* Circuit Breaker Status Badge */}
+          <div
+            className={`flex items-center space-x-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold tracking-wider ${
+              isHalted
+                ? 'border-rose-500/50 bg-rose-500/20 text-rose-300 animate-pulse'
+                : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400'
+            }`}
+          >
+            <span className={`h-1.5 w-1.5 rounded-full ${isHalted ? 'bg-rose-500' : 'bg-emerald-400'}`} />
+            <span>{isHalted ? 'HALTED' : 'ACTIVE'}</span>
           </div>
         </div>
 

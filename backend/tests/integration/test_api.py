@@ -145,3 +145,152 @@ def test_websocket_bars_subscription(client: TestClient) -> None:
         if len(bars) > 0:
             assert "close" in bars[0]
             assert "time" in bars[0]
+
+
+def test_book_endpoint(client: TestClient) -> None:
+    """Verify /api/v1/book returns L2 order book depth snapshot."""
+    client.post(
+        "/api/v1/sessions",
+        json={
+            "seed": 123,
+            "symbol": "AAPL",
+            "trades_per_sec": 100.0,
+            "initial_price": 150.0,
+            "volatility": 0.20,
+            "tick_size": 0.01,
+        },
+    )
+
+    res = client.get("/api/v1/book?symbol=AAPL&levels=5")
+    assert res.status_code == 200
+    book = res.json()
+    assert book["symbol"] == "AAPL"
+    assert "bids" in book
+    assert "asks" in book
+    assert isinstance(book["bids"], list)
+    assert isinstance(book["asks"], list)
+    assert len(book["bids"]) <= 5
+    assert len(book["asks"]) <= 5
+    if len(book["bids"]) > 0:
+        assert "price" in book["bids"][0]
+        assert "qty" in book["bids"][0]
+
+
+def test_websocket_book_subscription(client: TestClient) -> None:
+    """Verify WebSocket subscribing to book channel receives book deltas."""
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text(json.dumps({"type": "SUBSCRIBE", "channel": "book:AAPL"}))
+        ack = json.loads(ws.receive_text())
+        assert ack["type"] == "ACK"
+        assert ack["channel"] == "book:AAPL"
+
+        # Wait for delta message
+        msg = json.loads(ws.receive_text())
+        assert msg["type"] == "DATA"
+        assert msg["channel"] == "book:AAPL"
+        assert "deltas" in msg["data"]
+        assert isinstance(msg["data"]["deltas"], list)
+
+
+def test_scenarios_and_injection_endpoints(client: TestClient) -> None:
+    """Verify /api/v1/scenarios and /api/v1/scenarios/inject endpoints."""
+    # Start session
+    client.post(
+        "/api/v1/sessions",
+        json={
+            "seed": 42,
+            "symbol": "AAPL",
+            "trades_per_sec": 50.0,
+            "initial_price": 150.0,
+            "volatility": 0.20,
+            "tick_size": 0.01,
+        },
+    )
+
+    # 1. List scenarios
+    res = client.get("/api/v1/scenarios")
+    assert res.status_code == 200
+    catalog = res.json()
+    assert isinstance(catalog, list)
+    assert len(catalog) >= 5
+
+    # 2. Inject positive earnings shock
+    inj_res = client.post(
+        "/api/v1/scenarios/inject",
+        json={
+            "scenario_id": "earnings_shock_positive",
+            "symbol": "AAPL",
+            "params": {"jump_pct": 0.05},
+        },
+    )
+    assert inj_res.status_code == 200
+    assert inj_res.json()["status"] == "injected"
+
+    # 3. Check market status
+    status_res = client.get("/api/v1/market-status?symbol=AAPL")
+    assert status_res.status_code == 200
+    assert status_res.json()["status"] == "ACTIVE"
+
+    # 4. Inject halt
+    halt_res = client.post(
+        "/api/v1/scenarios/inject",
+        json={
+            "scenario_id": "halt_trading",
+            "symbol": "AAPL",
+            "params": {"reason": "CIRCUIT_BREAKER"},
+        },
+    )
+    assert halt_res.status_code == 200
+    assert halt_res.json()["is_halted"] is True
+
+    # 5. Check market status reflects halt
+    status_res2 = client.get("/api/v1/market-status?symbol=AAPL")
+    assert status_res2.status_code == 200
+    assert status_res2.json()["status"] == "HALTED"
+    assert status_res2.json()["is_halted"] is True
+
+    # 6. Book snapshot also reflects halt
+    book_res = client.get("/api/v1/book?symbol=AAPL")
+    assert book_res.status_code == 200
+    assert book_res.json()["is_halted"] is True
+
+    # 7. Resume trading
+    res_res = client.post(
+        "/api/v1/scenarios/inject",
+        json={"scenario_id": "resume_trading", "symbol": "AAPL"},
+    )
+    assert res_res.status_code == 200
+    assert res_res.json()["is_halted"] is False
+
+
+def test_anomalies_and_websocket_events_subscription(client: TestClient) -> None:
+    """Verify /api/v1/anomalies endpoint and WebSocket anomaly/event channels."""
+    client.post(
+        "/api/v1/sessions",
+        json={
+            "seed": 42,
+            "symbol": "AAPL",
+            "trades_per_sec": 100.0,
+            "initial_price": 150.0,
+            "volatility": 0.20,
+            "tick_size": 0.01,
+        },
+    )
+
+    # Fetch anomalies list
+    anom_res = client.get("/api/v1/anomalies?limit=20")
+    assert anom_res.status_code == 200
+    assert isinstance(anom_res.json(), list)
+
+    with client.websocket_connect("/ws") as ws:
+        # Subscribe to anomalies channel
+        ws.send_text(json.dumps({"type": "SUBSCRIBE", "channel": "anomalies:AAPL"}))
+        ack1 = json.loads(ws.receive_text())
+        assert ack1["type"] == "ACK"
+        assert ack1["channel"] == "anomalies:AAPL"
+
+        # Subscribe to events channel
+        ws.send_text(json.dumps({"type": "SUBSCRIBE", "channel": "events:market"}))
+        ack2 = json.loads(ws.receive_text())
+        assert ack2["type"] == "ACK"
+        assert ack2["channel"] == "events:market"

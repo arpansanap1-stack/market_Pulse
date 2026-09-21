@@ -1,10 +1,20 @@
-import type { Bar, Trade, WebSocketEnvelope } from '../types/protocol';
+import type {
+  Bar,
+  BookDeltaItem,
+  MarketAnomaly,
+  MarketEventPayload,
+  Trade,
+  WebSocketEnvelope,
+} from '../types/protocol';
 
 export type ConnectionStatus = 'CONNECTED' | 'CONNECTING' | 'DISCONNECTED';
 
 type MessageHandler = (envelope: WebSocketEnvelope) => void;
 type TradesBatchHandler = (trades: Trade[]) => void;
 type BarsBatchHandler = (interval: string, bars: Bar[]) => void;
+type BookBatchHandler = (deltas: BookDeltaItem[]) => void;
+type AnomaliesBatchHandler = (anomalies: MarketAnomaly[]) => void;
+type MarketEventsBatchHandler = (events: MarketEventPayload[]) => void;
 type StatusHandler = (status: ConnectionStatus) => void;
 
 export class MarketPulseWebSocketClient {
@@ -20,6 +30,9 @@ export class MarketPulseWebSocketClient {
   private onMessageCallbacks: Set<MessageHandler> = new Set();
   private onTradesBatchCallbacks: Set<TradesBatchHandler> = new Set();
   private onBarsBatchCallbacks: Set<BarsBatchHandler> = new Set();
+  private onBookBatchCallbacks: Set<BookBatchHandler> = new Set();
+  private onAnomaliesBatchCallbacks: Set<AnomaliesBatchHandler> = new Set();
+  private onMarketEventsBatchCallbacks: Set<MarketEventsBatchHandler> = new Set();
   private onStatusCallbacks: Set<StatusHandler> = new Set();
 
   constructor(url?: string) {
@@ -128,6 +141,21 @@ export class MarketPulseWebSocketClient {
     return () => this.onBarsBatchCallbacks.delete(handler);
   }
 
+  public onBookBatch(handler: BookBatchHandler): () => void {
+    this.onBookBatchCallbacks.add(handler);
+    return () => this.onBookBatchCallbacks.delete(handler);
+  }
+
+  public onAnomaliesBatch(handler: AnomaliesBatchHandler): () => void {
+    this.onAnomaliesBatchCallbacks.add(handler);
+    return () => this.onAnomaliesBatchCallbacks.delete(handler);
+  }
+
+  public onMarketEventsBatch(handler: MarketEventsBatchHandler): () => void {
+    this.onMarketEventsBatchCallbacks.add(handler);
+    return () => this.onMarketEventsBatchCallbacks.delete(handler);
+  }
+
   public onStatusChange(handler: StatusHandler): () => void {
     this.onStatusCallbacks.add(handler);
     handler(this.status);
@@ -169,6 +197,36 @@ export class MarketPulseWebSocketClient {
       if (data?.bars && Array.isArray(data.bars) && data.bars.length > 0) {
         for (const cb of this.onBarsBatchCallbacks) {
           cb(interval, data.bars);
+        }
+      }
+    }
+
+    // Handle batched book deltas
+    if (envelope.type === 'DATA' && envelope.channel?.startsWith('book:')) {
+      const data = envelope.data as { deltas?: BookDeltaItem[] } | undefined;
+      if (data?.deltas && Array.isArray(data.deltas) && data.deltas.length > 0) {
+        for (const cb of this.onBookBatchCallbacks) {
+          cb(data.deltas);
+        }
+      }
+    }
+
+    // Handle batched anomalies
+    if (envelope.type === 'DATA' && envelope.channel?.startsWith('anomalies:')) {
+      const data = envelope.data as { anomalies?: MarketAnomaly[] } | undefined;
+      if (data?.anomalies && Array.isArray(data.anomalies) && data.anomalies.length > 0) {
+        for (const cb of this.onAnomaliesBatchCallbacks) {
+          cb(data.anomalies);
+        }
+      }
+    }
+
+    // Handle batched market events
+    if (envelope.type === 'DATA' && envelope.channel?.startsWith('events:')) {
+      const data = envelope.data as { market_events?: MarketEventPayload[] } | undefined;
+      if (data?.market_events && Array.isArray(data.market_events) && data.market_events.length > 0) {
+        for (const cb of this.onMarketEventsBatchCallbacks) {
+          cb(data.market_events);
         }
       }
     }

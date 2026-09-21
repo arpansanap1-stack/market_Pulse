@@ -1,18 +1,33 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { AnomalyFeed } from './components/AnomalyFeed';
+import { DepthLadder } from './components/DepthLadder';
 import { Header } from './components/Header';
 import { MarketStatsCards } from './components/MarketStats';
 import { PriceChart } from './components/PriceChart';
 import type { PriceChartHandle } from './components/PriceChart';
+import { ScenarioControls } from './components/ScenarioControls';
 import { TradeTape } from './components/TradeTape';
 import { MarketPulseWebSocketClient } from './services/wsClient';
 import type { ConnectionStatus } from './services/wsClient';
-import type { ChartTimeframe, MarketStats, Trade } from './types/protocol';
+import type {
+  BookDeltaItem,
+  ChartTimeframe,
+  MarketAnomaly,
+  MarketStats,
+  MarketStatus,
+  Trade,
+} from './types/protocol';
 
 export const App: React.FC = () => {
   const [status, setStatus] = useState<ConnectionStatus>('CONNECTING');
   const [currentTps, setCurrentTps] = useState<number>(50);
   const [currentTimeframe, setCurrentTimeframe] = useState<ChartTimeframe>('1s');
   const [recentTrades, setRecentTrades] = useState<Trade[]>([]);
+  const [bookDeltas, setBookDeltas] = useState<BookDeltaItem[]>([]);
+  const [anomalies, setAnomalies] = useState<MarketAnomaly[]>([]);
+  const [marketStatus, setMarketStatus] = useState<MarketStatus | null>(null);
+  const [rightPanelTab, setRightPanelTab] = useState<'ANOMALIES' | 'TAPE'>('ANOMALIES');
+
   const [stats, setStats] = useState<MarketStats>({
     symbol: 'AAPL',
     lastPrice: 150.0,
@@ -32,6 +47,16 @@ export const App: React.FC = () => {
   statsRef.current = stats;
   const currentTimeframeRef = useRef<ChartTimeframe>(currentTimeframe);
   currentTimeframeRef.current = currentTimeframe;
+
+  // Fetch initial market status
+  useEffect(() => {
+    fetch('http://localhost:8000/api/v1/market-status?symbol=AAPL')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: MarketStatus | null) => {
+        if (data) setMarketStatus(data);
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     const client = new MarketPulseWebSocketClient();
@@ -90,15 +115,49 @@ export const App: React.FC = () => {
       }
     });
 
-    // Subscribe to symbol trades and active bar interval
+    const unsubscribeBook = client.onBookBatch((deltas) => {
+      setBookDeltas(deltas);
+    });
+
+    const unsubscribeAnomalies = client.onAnomaliesBatch((newAnoms) => {
+      setAnomalies((prev) => [...newAnoms, ...prev].slice(0, 100));
+    });
+
+    const unsubscribeMarketEvents = client.onMarketEventsBatch((events) => {
+      for (const evt of events) {
+        if (evt.kind === 'HALT') {
+          setMarketStatus((prev) => ({
+            symbol: prev?.symbol || 'AAPL',
+            latest_price: prev?.latest_price || statsRef.current.lastPrice,
+            is_halted: true,
+            status: 'HALTED',
+          }));
+        } else if (evt.kind === 'RESUME') {
+          setMarketStatus((prev) => ({
+            symbol: prev?.symbol || 'AAPL',
+            latest_price: prev?.latest_price || statsRef.current.lastPrice,
+            is_halted: false,
+            status: 'ACTIVE',
+          }));
+        }
+      }
+    });
+
+    // Subscribe to symbol trades, order book, bar interval, anomalies, and events
     client.subscribe('trades:AAPL');
+    client.subscribe('book:AAPL');
     client.subscribe(`bars:AAPL:${currentTimeframeRef.current}`);
+    client.subscribe('anomalies:AAPL');
+    client.subscribe('events:market');
     client.connect();
 
     return () => {
       unsubscribeStatus();
       unsubscribeTrades();
       unsubscribeBars();
+      unsubscribeBook();
+      unsubscribeAnomalies();
+      unsubscribeMarketEvents();
       client.disconnect();
       clientRef.current = null;
     };
@@ -156,8 +215,44 @@ export const App: React.FC = () => {
         tradesPerSec: currentTps,
       });
       setRecentTrades([]);
+      setBookDeltas([]);
+      setAnomalies([]);
+      setMarketStatus({
+        symbol: 'AAPL',
+        is_halted: false,
+        status: 'ACTIVE',
+        latest_price: 150.0,
+      });
     } catch (err) {
       console.error('Failed to reset session:', err);
+    }
+  };
+
+  const handleInjectScenario = async (scenarioId: string, params?: Record<string, unknown>) => {
+    try {
+      const res = await fetch('http://localhost:8000/api/v1/scenarios/inject', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          scenario_id: scenarioId,
+          symbol: stats.symbol,
+          params: params || {},
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (typeof data.is_halted === 'boolean') {
+          setMarketStatus((prev) => ({
+            symbol: prev?.symbol || stats.symbol,
+            latest_price: prev?.latest_price || stats.lastPrice,
+            is_halted: data.is_halted,
+            status: data.is_halted ? 'HALTED' : 'ACTIVE',
+          }));
+        }
+      }
+    } catch (err) {
+      console.error('Failed to inject scenario:', err);
+      throw err;
     }
   };
 
@@ -168,19 +263,26 @@ export const App: React.FC = () => {
         status={status}
         stats={stats}
         currentTps={currentTps}
+        isHalted={marketStatus?.is_halted}
         onSetSimulationSpeed={handleSetSpeed}
         onResetSession={handleResetSession}
       />
 
       {/* Main Terminal Workspace Layout */}
-      <div className="flex-1 flex flex-col p-4 gap-4 overflow-hidden min-h-0">
+      <div className="flex-1 flex flex-col p-4 gap-3.5 overflow-hidden min-h-0">
         {/* Top Metric Cards */}
         <MarketStatsCards stats={stats} />
 
-        {/* Center Grid: Chart + Trade Tape */}
-        <div className="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-4 min-h-0">
-          {/* Main Chart Pane (2 Columns) */}
-          <div className="lg:col-span-2 h-full flex flex-col min-h-0">
+        {/* Exogenous Market Scenarios & Circuit Breaker Launcher */}
+        <ScenarioControls
+          marketStatus={marketStatus}
+          onInject={handleInjectScenario}
+        />
+
+        {/* Center 12-Column Grid: Chart (6) + Order Book (3) + Tabbed Panel (3) */}
+        <div className="flex-1 grid grid-cols-12 gap-3.5 min-h-0">
+          {/* Main Chart Pane (6 Columns) */}
+          <div className="col-span-12 lg:col-span-6 xl:col-span-6 h-full flex flex-col min-h-0">
             <PriceChart
               ref={chartRef}
               symbol={stats.symbol}
@@ -188,9 +290,56 @@ export const App: React.FC = () => {
             />
           </div>
 
-          {/* Right Tape Pane (1 Column) */}
-          <div className="lg:col-span-1 h-full flex flex-col min-h-0">
-            <TradeTape trades={recentTrades} />
+          {/* L2 Order Book Depth Ladder (3 Columns) */}
+          <div className="col-span-12 sm:col-span-6 lg:col-span-3 xl:col-span-3 h-full flex flex-col min-h-0">
+            <DepthLadder symbol={stats.symbol} deltas={bookDeltas} levels={10} />
+          </div>
+
+          {/* Right Tabbed Panel: Microstructure Anomalies vs Trade Tape (3 Columns) */}
+          <div className="col-span-12 sm:col-span-6 lg:col-span-3 xl:col-span-3 h-full flex flex-col min-h-0 bg-slate-900 border border-slate-800 rounded-lg overflow-hidden shadow-xl">
+            {/* Panel Selector Tabs */}
+            <div className="flex items-center border-b border-slate-800 bg-slate-950/70 p-1">
+              <button
+                onClick={() => setRightPanelTab('ANOMALIES')}
+                className={`flex-1 py-1.5 text-xs font-semibold rounded transition-colors flex items-center justify-center gap-1.5 ${
+                  rightPanelTab === 'ANOMALIES'
+                    ? 'bg-slate-800 text-sky-400 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <span>⚡ Anomalies</span>
+                {anomalies.length > 0 && (
+                  <span className="px-1.5 py-0.2 rounded-full text-[9px] font-mono bg-rose-500/20 text-rose-300">
+                    {anomalies.length}
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={() => setRightPanelTab('TAPE')}
+                className={`flex-1 py-1.5 text-xs font-semibold rounded transition-colors flex items-center justify-center gap-1.5 ${
+                  rightPanelTab === 'TAPE'
+                    ? 'bg-slate-800 text-sky-400 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <span>📜 Trade Tape</span>
+                <span className="px-1.5 py-0.2 rounded-full text-[9px] font-mono bg-slate-700 text-slate-300">
+                  {recentTrades.length}
+                </span>
+              </button>
+            </div>
+
+            {/* Tab Contents */}
+            <div className="flex-1 min-h-0 overflow-hidden">
+              {rightPanelTab === 'ANOMALIES' ? (
+                <AnomalyFeed
+                  anomalies={anomalies}
+                  onClear={() => setAnomalies([])}
+                />
+              ) : (
+                <TradeTape trades={recentTrades} />
+              )}
+            </div>
           </div>
         </div>
       </div>
