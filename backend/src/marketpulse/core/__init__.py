@@ -1,4 +1,4 @@
-"""Pure domain logic for MarketPulse (matching engine, clock, events, indicators).
+"""Pure domain logic for MarketPulse (matching engine, clock, events, ohlc, indicators).
 
 Contains zero external I/O, database, or web framework dependencies.
 """
@@ -20,13 +20,43 @@ from marketpulse.core.events import (
     TimeInForce,
     TradeExecuted,
 )
+from marketpulse.core.indicators import (
+    BollingerBandsResult,
+    MACDResult,
+    StreamingBollingerBands,
+    StreamingEMA,
+    StreamingMACD,
+    StreamingRollingVolatility,
+    StreamingRSI,
+    StreamingSMA,
+    StreamingVolumeTrend,
+    StreamingVWAP,
+    batch_bollinger_bands,
+    batch_ema,
+    batch_macd,
+    batch_realized_volatility,
+    batch_rsi,
+    batch_sma,
+    batch_volume_trend,
+    batch_vwap,
+)
+from marketpulse.core.ohlc import (
+    INTERVAL_TO_NS,
+    Bar,
+    OHLCAggregator,
+)
 
 __all__ = [
+    "INTERVAL_TO_NS",
+    "Bar",
+    "BollingerBandsResult",
     "BookDelta",
     "Clock",
     "Event",
     "EventType",
+    "MACDResult",
     "MarketEvent",
+    "OHLCAggregator",
     "OrderAccepted",
     "OrderCanceled",
     "OrderRejected",
@@ -36,7 +66,23 @@ __all__ = [
     "SessionStarted",
     "Side",
     "SimulatedClock",
+    "StreamingBollingerBands",
+    "StreamingEMA",
+    "StreamingMACD",
+    "StreamingRSI",
+    "StreamingRollingVolatility",
+    "StreamingSMA",
+    "StreamingVWAP",
+    "StreamingVolumeTrend",
     "TimeInForce",
     "TradeExecuted",
     "WallClock",
+    "batch_bollinger_bands",
+    "batch_ema",
+    "batch_macd",
+    "batch_realized_volatility",
+    "batch_rsi",
+    "batch_sma",
+    "batch_volume_trend",
+    "batch_vwap",
 ]

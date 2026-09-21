@@ -43,6 +43,8 @@ class Broadcaster:
 
         # Buffered trades: channel -> list of trade dicts
         self._pending_trades: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        # Buffered bars: channel -> list of bar dicts
+        self._pending_bars: dict[str, list[dict[str, Any]]] = defaultdict(list)
         # Monotonic sequence counter per channel
         self._channel_seq: dict[str, int] = defaultdict(int)
 
@@ -91,12 +93,14 @@ class Broadcaster:
             self._client_channels[client_id].discard(channel)
 
     def push_trade(self, symbol: str, trade_dict: dict[str, Any]) -> None:
-        """Enqueue a trade for batch dispatch on channel trades:{symbol}.
-
-        Thread-safe / fast synchronous call designed for high-frequency producer loops.
-        """
+        """Enqueue a trade for batch dispatch on channel trades:{symbol}."""
         channel = f"trades:{symbol}"
         self._pending_trades[channel].append(trade_dict)
+
+    def push_bar(self, symbol: str, interval: str, bar_dict: dict[str, Any]) -> None:
+        """Enqueue an OHLC bar update for dispatch on channel bars:{symbol}:{interval}."""
+        channel = f"bars:{symbol}:{interval}"
+        self._pending_bars[channel].append(bar_dict)
 
     async def _run_flush_loop(self) -> None:
         """Periodic flush loop dispatching batched messages at throttling_fps."""
@@ -108,17 +112,20 @@ class Broadcaster:
             await asyncio.sleep(sleep_duration)
 
     async def flush(self) -> None:
-        """Flush all pending trade batches to subscribed clients."""
-        if not self._pending_trades:
+        """Flush all pending trade and bar batches to subscribed clients."""
+        if not self._pending_trades and not self._pending_bars:
             return
 
         async with self._lock:
-            batches_to_send = dict(self._pending_trades)
+            trade_batches = dict(self._pending_trades)
+            bar_batches = dict(self._pending_bars)
             self._pending_trades.clear()
+            self._pending_bars.clear()
 
         epoch_ms = int(time.time() * 1000)
 
-        for channel, trades in batches_to_send.items():
+        # 1. Flush trade batches
+        for channel, trades in trade_batches.items():
             if not trades:
                 continue
 
@@ -139,22 +146,46 @@ class Broadcaster:
                     "trades": trades,
                 },
             }
-            msg = json.dumps(envelope)
+            self._send_to_subscribers(subscribers, json.dumps(envelope))
 
-            # Broadcast to all subscribed clients with backpressure handling
-            for client_id in list(subscribers):
-                queue = self._client_queues.get(client_id)
-                if queue is not None:
+        # 2. Flush bar batches
+        for channel, bars in bar_batches.items():
+            if not bars:
+                continue
+
+            subscribers = self._channel_subscriptions.get(channel)
+            if not subscribers:
+                continue
+
+            self._channel_seq[channel] += 1
+            seq = self._channel_seq[channel]
+
+            envelope = {
+                "version": 1,
+                "type": "DATA",
+                "channel": channel,
+                "seq": seq,
+                "ts": epoch_ms,
+                "data": {
+                    "bars": bars,
+                },
+            }
+            self._send_to_subscribers(subscribers, json.dumps(envelope))
+
+    def _send_to_subscribers(self, subscribers: set[str], msg: str) -> None:
+        """Dispatch serialized message to a set of client subscribers."""
+        for client_id in list(subscribers):
+            queue = self._client_queues.get(client_id)
+            if queue is not None:
+                try:
+                    queue.put_nowait(msg)
+                except asyncio.QueueFull:
+                    logger.warning(
+                        "Client queue full for %s, dropping frame to maintain backpressure",
+                        client_id,
+                    )
                     try:
+                        _ = queue.get_nowait()
                         queue.put_nowait(msg)
-                    except asyncio.QueueFull:
-                        # Client is lagging: drop oldest message or skip to avoid blocking
-                        logger.warning(
-                            "Client queue full for %s, dropping frame to maintain backpressure",
-                            client_id,
-                        )
-                        try:
-                            _ = queue.get_nowait()
-                            queue.put_nowait(msg)
-                        except (asyncio.QueueEmpty, asyncio.QueueFull):
-                            pass
+                    except (asyncio.QueueEmpty, asyncio.QueueFull):
+                        pass

@@ -6,11 +6,12 @@ import type { PriceChartHandle } from './components/PriceChart';
 import { TradeTape } from './components/TradeTape';
 import { MarketPulseWebSocketClient } from './services/wsClient';
 import type { ConnectionStatus } from './services/wsClient';
-import type { MarketStats, Trade } from './types/protocol';
+import type { ChartTimeframe, MarketStats, Trade } from './types/protocol';
 
 export const App: React.FC = () => {
   const [status, setStatus] = useState<ConnectionStatus>('CONNECTING');
   const [currentTps, setCurrentTps] = useState<number>(50);
+  const [currentTimeframe, setCurrentTimeframe] = useState<ChartTimeframe>('1s');
   const [recentTrades, setRecentTrades] = useState<Trade[]>([]);
   const [stats, setStats] = useState<MarketStats>({
     symbol: 'AAPL',
@@ -29,6 +30,8 @@ export const App: React.FC = () => {
   const clientRef = useRef<MarketPulseWebSocketClient | null>(null);
   const statsRef = useRef<MarketStats>(stats);
   statsRef.current = stats;
+  const currentTimeframeRef = useRef<ChartTimeframe>(currentTimeframe);
+  currentTimeframeRef.current = currentTimeframe;
 
   useEffect(() => {
     const client = new MarketPulseWebSocketClient();
@@ -81,17 +84,33 @@ export const App: React.FC = () => {
       });
     });
 
-    // Subscribe to symbol channel
+    const unsubscribeBars = client.onBarsBatch((interval, newBars) => {
+      if (chartRef.current) {
+        chartRef.current.updateWithBars(interval, newBars);
+      }
+    });
+
+    // Subscribe to symbol trades and active bar interval
     client.subscribe('trades:AAPL');
+    client.subscribe(`bars:AAPL:${currentTimeframeRef.current}`);
     client.connect();
 
     return () => {
       unsubscribeStatus();
       unsubscribeTrades();
+      unsubscribeBars();
       client.disconnect();
       clientRef.current = null;
     };
   }, []);
+
+  const handleTimeframeChange = (newTf: ChartTimeframe) => {
+    if (clientRef.current) {
+      clientRef.current.unsubscribe(`bars:${stats.symbol}:${currentTimeframeRef.current}`);
+      clientRef.current.subscribe(`bars:${stats.symbol}:${newTf}`);
+    }
+    setCurrentTimeframe(newTf);
+  };
 
   const handleSetSpeed = async (tps: number) => {
     setCurrentTps(tps);
@@ -162,7 +181,11 @@ export const App: React.FC = () => {
         <div className="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-4 min-h-0">
           {/* Main Chart Pane (2 Columns) */}
           <div className="lg:col-span-2 h-full flex flex-col min-h-0">
-            <PriceChart ref={chartRef} symbol={stats.symbol} />
+            <PriceChart
+              ref={chartRef}
+              symbol={stats.symbol}
+              onTimeframeChange={handleTimeframeChange}
+            />
           </div>
 
           {/* Right Tape Pane (1 Column) */}

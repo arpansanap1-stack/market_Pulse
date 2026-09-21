@@ -11,12 +11,22 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import numpy as np
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from marketpulse.api.broadcaster import Broadcaster
 from marketpulse.core.events import TradeExecuted, ticks_to_price
+from marketpulse.core.indicators import (
+    batch_bollinger_bands,
+    batch_ema,
+    batch_macd,
+    batch_rsi,
+    batch_sma,
+    batch_vwap,
+)
+from marketpulse.core.ohlc import OHLCAggregator
 from marketpulse.sim.stub_gbm import StubGBMSource
 
 logger = logging.getLogger(__name__)
@@ -42,6 +52,7 @@ class SimulationRunner:
         self.recent_trades: deque[dict[str, Any]] = deque(maxlen=max_history)
         self.current_config = SessionConfigRequest()
         self.source: StubGBMSource | None = None
+        self.aggregator: OHLCAggregator = OHLCAggregator(symbol="AAPL")
         self._sim_task: asyncio.Task[None] | None = None
         self._running: bool = False
         self._latest_price: float = 150.0
@@ -51,6 +62,7 @@ class SimulationRunner:
         self.stop()
         self.current_config = config
         self._latest_price = config.initial_price
+        self.aggregator = OHLCAggregator(symbol=config.symbol)
         self.source = StubGBMSource(
             seed=config.seed,
             symbol=config.symbol,
@@ -69,7 +81,7 @@ class SimulationRunner:
             self._sim_task = None
 
     async def _run_simulation(self) -> None:
-        """Producer loop emitting simulated trades at trades_per_sec rate."""
+        """Producer loop emitting simulated trades and OHLC updates."""
         assert self.source is not None
         interval_s = 1.0 / self.current_config.trades_per_sec
 
@@ -77,7 +89,7 @@ class SimulationRunner:
             while self._running:
                 start_t = asyncio.get_event_loop().time()
 
-                # Generate event from stub source
+                # Generate trade from stub source
                 event = self.source.next_event()
                 if isinstance(event, TradeExecuted):
                     price = ticks_to_price(event.price_ticks, self.current_config.tick_size)
@@ -95,11 +107,26 @@ class SimulationRunner:
                     self.recent_trades.append(trade_dict)
                     self.broadcaster.push_trade(event.symbol, trade_dict)
 
+                    # Update incremental OHLC aggregator across all intervals
+                    bar_updates = self.aggregator.update_trade(event)
+                    for interval, bars in bar_updates.items():
+                        for bar in bars:
+                            self.broadcaster.push_bar(
+                                event.symbol,
+                                interval,
+                                bar.to_dict(self.current_config.tick_size),
+                            )
+
                 elapsed = asyncio.get_event_loop().time() - start_t
                 sleep_t = max(0.0, interval_s - elapsed)
                 await asyncio.sleep(sleep_t)
         except asyncio.CancelledError:
             pass
+
+
+def _clean_array(arr: np.ndarray) -> list[float | None]:
+    """Convert numpy array with NaNs to JSON-compliant list of floats and Nones."""
+    return [None if np.isnan(x) else round(float(x), 4) for x in arr]
 
 
 def create_app(throttling_fps: int = 20) -> FastAPI:
@@ -123,7 +150,6 @@ def create_app(throttling_fps: int = 20) -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Enable CORS for frontend dev server
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -156,6 +182,77 @@ def create_app(throttling_fps: int = 20) -> FastAPI:
         """Return most recent historical trades."""
         trades = list(sim_runner.recent_trades)
         return trades[-limit:] if limit > 0 else trades
+
+    @app.get("/api/v1/bars")
+    async def get_bars(
+        symbol: str = "AAPL",
+        interval: str = "1s",
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Return historical and current bars for a symbol and interval."""
+        if symbol != sim_runner.current_config.symbol:
+            raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not active")
+
+        try:
+            closed_bars = sim_runner.aggregator.get_history(interval, limit=limit)
+        except ValueError as err:
+            raise HTTPException(status_code=400, detail=str(err)) from err
+
+        tick_size = sim_runner.current_config.tick_size
+        results = [b.to_dict(tick_size) for b in closed_bars]
+
+        current_bar = sim_runner.aggregator.get_current_bar(interval)
+        if current_bar is not None:
+            results.append(current_bar.to_dict(tick_size))
+
+        return results[-limit:] if limit > 0 else results
+
+    @app.get("/api/v1/indicators")
+    async def get_indicators(
+        symbol: str = "AAPL",
+        interval: str = "1s",
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        """Calculate batch technical indicators for historical bars."""
+        bars_data = await get_bars(symbol=symbol, interval=interval, limit=limit)
+        if not bars_data:
+            return {"times": [], "indicators": {}}
+
+        times = [b["time"] for b in bars_data]
+        closes = np.array([b["close"] for b in bars_data], dtype=np.float64)
+        volumes = np.array([b["volume"] for b in bars_data], dtype=np.float64)
+
+        # Batch calculations
+        sma20 = batch_sma(closes, period=min(20, max(1, len(closes))))
+        ema20 = batch_ema(closes, period=min(20, max(1, len(closes))))
+        rsi14 = batch_rsi(closes, period=min(14, max(1, len(closes) - 1)))
+        macd_line, sig_line, hist = batch_macd(closes, fast=12, slow=26, signal=9)
+        upper, middle, lower, _ = batch_bollinger_bands(
+            closes, period=min(20, max(2, len(closes))), num_std=2.0
+        )
+        vwap = batch_vwap(closes, volumes)
+
+        return {
+            "symbol": symbol,
+            "interval": interval,
+            "times": times,
+            "indicators": {
+                "sma20": _clean_array(sma20),
+                "ema20": _clean_array(ema20),
+                "rsi14": _clean_array(rsi14),
+                "macd": {
+                    "macd": _clean_array(macd_line),
+                    "signal": _clean_array(sig_line),
+                    "histogram": _clean_array(hist),
+                },
+                "bollinger": {
+                    "upper": _clean_array(upper),
+                    "middle": _clean_array(middle),
+                    "lower": _clean_array(lower),
+                },
+                "vwap": _clean_array(vwap),
+            },
+        }
 
     @app.post("/api/v1/sessions")
     async def configure_session(req: SessionConfigRequest) -> dict[str, Any]:
@@ -195,7 +292,6 @@ def create_app(throttling_fps: int = 20) -> FastAPI:
 
                 if msg_type == "SUBSCRIBE" and channel:
                     broadcaster.subscribe(client_id, channel)
-                    # Acknowledge subscription
                     await websocket.send_text(
                         json.dumps(
                             {
@@ -235,3 +331,6 @@ def create_app(throttling_fps: int = 20) -> FastAPI:
             broadcaster.unregister_client(client_id)
 
     return app
+
+
+app = create_app()

@@ -69,3 +69,27 @@ This document records the key architectural and design decisions made throughout
 - **Decision:** Drive TradingView Lightweight Charts directly via `series.update(...)` inside a `requestAnimationFrame` loop or event callback. React state is reserved strictly for UI metadata (connection badge, last price, capped trade tape).
 - **Alternatives Considered:**
   - Full React state re-rendering: High frame drops and latency spikes during high-throughput bursts.
+
+---
+
+## ADR-008: Empty Interval Forward-Fill Policy for OHLC Aggregation
+
+- **Context:** In financial markets with intermittent or illiquid trading, intervals (e.g. 1s, 5s) may elapse with zero executed trades. Downstream charting libraries and technical indicators require uninterrupted contiguous time series.
+- **Decision:** When an incoming trade crosses over one or more unpopulated interval buckets, the aggregator emits synthetic closed bars for each intermediate interval with `open = high = low = close = previous_close`, `volume = 0`, and `trade_count = 0`.
+- **Alternatives Considered:**
+  - Omit empty bars: Creates non-uniform timestamps; breaks fixed-window rolling indicators like SMA and RSI.
+  - Interpolate prices: Fictitious price points distort realized volatility and Bollinger Band width.
+
+---
+
+## ADR-009: Wilder Smoothing Seed and Indicator Warm-Up Policy
+
+- **Context:** Technical indicators (EMA, RSI, MACD, Bollinger Bands) require a warm-up sequence before producing statistically sound values. Different market data systems use differing conventions for initial seed values (e.g., EMA seeded by SMA vs first value; RSI Wilder smoothing vs exponential).
+- **Decision:**
+  - EMA: The initial seed at step $N$ is the arithmetic mean (SMA) of the first $N$ prices; subsequent steps use $\alpha = 2 / (N + 1)$.
+  - RSI: Uses Wilder's smoothing with period 14 (requires 15 price points; first 14 price differences to seed average gain/loss).
+  - Warm-up values return `None` (streaming) and `np.nan` (batch) until the full lookback window is populated.
+- **Alternatives Considered:**
+  - Zero-filling during warm-up: Distorts moving averages and indicators toward zero.
+  - Seeding EMA with first raw price ($P_0$): Produces high initial bias that lingers across dozens of steps.
+

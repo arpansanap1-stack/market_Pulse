@@ -1,9 +1,10 @@
-import type { Trade, WebSocketEnvelope } from '../types/protocol';
+import type { Bar, Trade, WebSocketEnvelope } from '../types/protocol';
 
 export type ConnectionStatus = 'CONNECTED' | 'CONNECTING' | 'DISCONNECTED';
 
 type MessageHandler = (envelope: WebSocketEnvelope) => void;
 type TradesBatchHandler = (trades: Trade[]) => void;
+type BarsBatchHandler = (interval: string, bars: Bar[]) => void;
 type StatusHandler = (status: ConnectionStatus) => void;
 
 export class MarketPulseWebSocketClient {
@@ -18,6 +19,7 @@ export class MarketPulseWebSocketClient {
 
   private onMessageCallbacks: Set<MessageHandler> = new Set();
   private onTradesBatchCallbacks: Set<TradesBatchHandler> = new Set();
+  private onBarsBatchCallbacks: Set<BarsBatchHandler> = new Set();
   private onStatusCallbacks: Set<StatusHandler> = new Set();
 
   constructor(url?: string) {
@@ -121,6 +123,11 @@ export class MarketPulseWebSocketClient {
     return () => this.onTradesBatchCallbacks.delete(handler);
   }
 
+  public onBarsBatch(handler: BarsBatchHandler): () => void {
+    this.onBarsBatchCallbacks.add(handler);
+    return () => this.onBarsBatchCallbacks.delete(handler);
+  }
+
   public onStatusChange(handler: StatusHandler): () => void {
     this.onStatusCallbacks.add(handler);
     handler(this.status);
@@ -150,6 +157,18 @@ export class MarketPulseWebSocketClient {
       if (data?.trades && Array.isArray(data.trades) && data.trades.length > 0) {
         for (const cb of this.onTradesBatchCallbacks) {
           cb(data.trades);
+        }
+      }
+    }
+
+    // Handle batched bars
+    if (envelope.type === 'DATA' && envelope.channel?.startsWith('bars:')) {
+      const parts = envelope.channel.split(':');
+      const interval = parts[2] || '1s';
+      const data = envelope.data as { bars?: Bar[] } | undefined;
+      if (data?.bars && Array.isArray(data.bars) && data.bars.length > 0) {
+        for (const cb of this.onBarsBatchCallbacks) {
+          cb(interval, data.bars);
         }
       }
     }

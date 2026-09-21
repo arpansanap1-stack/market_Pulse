@@ -60,3 +60,44 @@ export interface MarketStats {
   tradesCount: number;
   tradesPerSec: number;
 }
+
+export interface Bar {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  trade_count: number;
+  vwap: number;
+}
+
+export interface BarsChannelData {
+  bars: Bar[];
+}
+
+export interface IndicatorValues {
+  symbol: string;
+  interval: string;
+  times: number[];
+  indicators: {
+    sma20: (number | null)[];
+    ema20: (number | null)[];
+    rsi14: (number | null)[];
+    macd: {
+      macd: (number | null)[];
+      signal: (number | null)[];
+      histogram: (number | null)[];
+    };
+    bollinger: {
+      upper: (number | null)[];
+      middle: (number | null)[];
+      lower: (number | null)[];
+    };
+    vwap: (number | null)[];
+  };
+}
+
+export type ChartTimeframe = '1s' | '5s' | '15s' | '1m';
+export type ChartType = 'candlestick' | 'area';
+

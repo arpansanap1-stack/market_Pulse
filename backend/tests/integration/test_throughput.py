@@ -7,6 +7,7 @@ import time
 import pytest
 
 from marketpulse.api.broadcaster import Broadcaster
+from marketpulse.core.events import TradeExecuted
 from marketpulse.sim.stub_gbm import StubGBMSource
 
 
@@ -27,15 +28,15 @@ async def test_high_throughput_coalescing() -> None:
     start_time = time.monotonic()
     for _ in range(2000):
         event = source.next_event()
-        assert event is not None
+        assert isinstance(event, TradeExecuted)
         trade_dict = {
             "seq": event.seq,
             "ts_ns": event.ts_ns,
             "symbol": event.symbol,
-            "trade_id": getattr(event, "trade_id"),
-            "price_ticks": getattr(event, "price_ticks"),
-            "qty": getattr(event, "qty"),
-            "aggressor_side": getattr(event, "aggressor_side").value,
+            "trade_id": event.trade_id,
+            "price_ticks": event.price_ticks,
+            "qty": event.qty,
+            "aggressor_side": event.aggressor_side.value,
         }
         broadcaster.push_trade("AAPL", trade_dict)
 
