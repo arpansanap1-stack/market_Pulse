@@ -47,7 +47,9 @@ def test_market_maker_agent() -> None:
         assert o.price_ticks is not None and o.price_ticks > 0
 
     # Best bid should be strictly less than best ask
-    assert max(b.price_ticks for b in bids) < min(a.price_ticks for a in asks)
+    bid_prices = [b.price_ticks for b in bids if b.price_ticks is not None]
+    ask_prices = [a.price_ticks for a in asks if a.price_ticks is not None]
+    assert max(bid_prices) < min(ask_prices)
 
 
 def test_noise_trader_agent() -> None:

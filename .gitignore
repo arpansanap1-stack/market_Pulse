@@ -62,6 +62,13 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# Databases & Storage
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
 # IDE & OS
 .idea/
 .vscode/
@@ -70,3 +77,4 @@ pnpm-debug.log*
 *~
 .DS_Store
 Thumbs.db
+

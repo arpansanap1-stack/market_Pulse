@@ -219,7 +219,9 @@ def test_price_time_priority_fifo() -> None:
     resting_s2 = engine.book.get_order("s2")
     assert resting_s2 is not None
     assert resting_s2.remaining_qty == 20
-    assert engine.book.asks.get_level(15000).total_qty == 20
+    lvl = engine.book.asks.get_level(15000)
+    assert lvl is not None
+    assert lvl.total_qty == 20
 
 
 def test_multi_level_sweep() -> None:
@@ -369,7 +371,9 @@ def test_fok_order() -> None:
     assert len(events1) == 1
     assert isinstance(events1[0], OrderRejected)
     assert events1[0].reason == "FOK_NOT_FILLABLE"
-    assert engine.book.asks.get_level(15000).total_qty == 30
+    lvl1 = engine.book.asks.get_level(15000)
+    assert lvl1 is not None
+    assert lvl1.total_qty == 30
 
     # 2. Buy 25 FOK when 30 available -> executes fully
     events2 = engine.submit_order(
@@ -388,7 +392,9 @@ def test_fok_order() -> None:
     trades = [e for e in events2 if isinstance(e, TradeExecuted)]
     assert len(trades) == 1
     assert trades[0].qty == 25
-    assert engine.book.asks.get_level(15000).total_qty == 5
+    lvl2 = engine.book.asks.get_level(15000)
+    assert lvl2 is not None
+    assert lvl2.total_qty == 5
 
 
 def test_market_order() -> None:

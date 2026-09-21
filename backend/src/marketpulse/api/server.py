@@ -9,6 +9,7 @@ import uuid
 from collections import deque
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from enum import StrEnum
 from typing import Any
 
 import numpy as np
@@ -20,7 +21,10 @@ from marketpulse.api.broadcaster import Broadcaster
 from marketpulse.core.anomaly import StreamingAnomalyDetector
 from marketpulse.core.events import (
     BookDelta,
+    Event,
     MarketEvent,
+    SessionEnded,
+    SessionStarted,
     Side,
     TradeExecuted,
     ticks_to_price,
@@ -42,8 +46,19 @@ from marketpulse.core.scenarios import (
     get_available_scenarios,
 )
 from marketpulse.sim.agent_source import AgentOrderSource
+from marketpulse.sim.replay_source import ReplayEventSource
+from marketpulse.storage.event_store import SessionMetadata, SQLiteEventStore
 
 logger = logging.getLogger(__name__)
+
+
+class RunnerMode(StrEnum):
+    """Execution mode of the simulation engine."""
+
+    LIVE = "LIVE"
+    REPLAY = "REPLAY"
+    PAUSED = "PAUSED"
+    STOPPED = "STOPPED"
 
 
 class SessionConfigRequest(BaseModel):
@@ -65,45 +80,172 @@ class ScenarioInjectRequest(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
 
 
-class SimulationRunner:
-    """Manages the lifecycle and event production of the market simulator."""
+class ReplayRequest(BaseModel):
+    """Request payload to start replaying a recorded session."""
 
-    def __init__(self, broadcaster: Broadcaster, max_history: int = 1000) -> None:
+    speed_multiplier: float = Field(default=1.0, gt=0, le=10000.0)
+    seek_seq: int = Field(default=1, ge=1)
+
+
+class SeekRequest(BaseModel):
+    """Request payload to seek an active replay to a target sequence."""
+
+    target_seq: int = Field(ge=1)
+
+
+class SpeedRequest(BaseModel):
+    """Request payload to update replay playback speed."""
+
+    speed_multiplier: float = Field(gt=0, le=10000.0)
+
+
+class ReplayDepthTracker:
+    """Maintains resting price level depth from BookDelta events for accurate replay snapshots."""
+
+    def __init__(self) -> None:
+        self.bids: dict[int, int] = {}
+        self.asks: dict[int, int] = {}
+
+    def clear(self) -> None:
+        """Clear all resting depth levels."""
+        self.bids.clear()
+        self.asks.clear()
+
+    def on_delta(self, side: Side, price_ticks: int, new_total_qty: int) -> None:
+        """Apply a book delta update to resting level quantity."""
+        target = self.bids if side == Side.BUY else self.asks
+        if new_total_qty <= 0:
+            target.pop(price_ticks, None)
+        else:
+            target[price_ticks] = new_total_qty
+
+    def snapshot(self, max_levels: int = 10) -> dict[str, Any]:
+        """Produce a sorted top-N depth ladder snapshot."""
+        sorted_bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:max_levels]
+        sorted_asks = sorted(self.asks.items(), key=lambda x: x[0])[:max_levels]
+        best_bid = sorted_bids[0][0] if sorted_bids else None
+        best_ask = sorted_asks[0][0] if sorted_asks else None
+        spread = (best_ask - best_bid) if (best_bid and best_ask) else None
+        mid_ticks = ((best_bid + best_ask) / 2.0) if (best_bid and best_ask) else None
+        return {
+            "bids": [{"price_ticks": p, "qty": q} for p, q in sorted_bids],
+            "asks": [{"price_ticks": p, "qty": q} for p, q in sorted_asks],
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread": spread,
+            "mid_price_ticks": mid_ticks,
+        }
+
+
+class SimulationRunner:
+    """Manages the lifecycle, storage persistence, and historical replay of market sessions."""
+
+    def __init__(
+        self,
+        broadcaster: Broadcaster,
+        store: SQLiteEventStore,
+        max_history: int = 1000,
+    ) -> None:
         self.broadcaster = broadcaster
+        self.store = store
         self.max_history = max_history
+        self.mode: RunnerMode = RunnerMode.STOPPED
+        self.active_session_id: str = ""
+        self.active_session_metadata: SessionMetadata | None = None
         self.recent_trades: deque[dict[str, Any]] = deque(maxlen=max_history)
         self.recent_anomalies: deque[dict[str, Any]] = deque(maxlen=max_history)
         self.recent_market_events: deque[dict[str, Any]] = deque(maxlen=max_history)
+        self.depth_tracker: ReplayDepthTracker = ReplayDepthTracker()
         self.current_config = SessionConfigRequest()
         self.source: AgentOrderSource | None = None
+        self.replay_source: ReplayEventSource | None = None
         self.aggregator: OHLCAggregator = OHLCAggregator(symbol="AAPL")
         self.anomaly_detector: StreamingAnomalyDetector = StreamingAnomalyDetector(symbol="AAPL")
         self._sim_task: asyncio.Task[None] | None = None
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._running: bool = False
+        self._replay_halted: bool = False
         self._latest_price: float = 150.0
+        self._current_seq: int = 0
+        self._total_events: int = 0
 
-    def start(self, config: SessionConfigRequest) -> None:
-        """Start or restart the simulation with new configuration."""
-        self.stop()
-        self.current_config = config
-        self._latest_price = config.initial_price
+    def _reset_terminal_state(self) -> None:
+        """Reset in-memory data structures prior to starting a new session or seeking."""
         self.recent_trades.clear()
         self.recent_anomalies.clear()
         self.recent_market_events.clear()
-        self.aggregator = OHLCAggregator(symbol=config.symbol)
-        self.anomaly_detector = StreamingAnomalyDetector(symbol=config.symbol)
+        self.depth_tracker.clear()
+        self._replay_halted = False
+        self.aggregator = OHLCAggregator(symbol=self.current_config.symbol)
+        self.anomaly_detector = StreamingAnomalyDetector(symbol=self.current_config.symbol)
+        self._latest_price = self.current_config.initial_price
+
+    def start(self, config: SessionConfigRequest) -> str:
+        """Start or restart a live simulation session with event log persistence."""
+        self.stop()
+        self.current_config = config
+        self._reset_terminal_state()
+
+        session_id = f"sess_{uuid.uuid4().hex[:12]}"
+        self.active_session_id = session_id
+
         self.source = AgentOrderSource(
             seed=config.seed,
             symbol=config.symbol,
             initial_price=config.initial_price,
             tick_size=config.tick_size,
         )
+
+        start_ts_ns = self.source._clock.now_ns()
+        self.active_session_metadata = self.store.create_session(
+            session_id=session_id,
+            symbol=config.symbol,
+            seed=config.seed,
+            config=config.model_dump(),
+            start_ts_ns=start_ts_ns,
+        )
+
+        # Log canonical SessionStarted event
+        evt_start = SessionStarted(
+            seq=self.source.engine.allocate_seq(),
+            ts_ns=start_ts_ns,
+            symbol=config.symbol,
+            session_id=session_id,
+            seed=config.seed,
+            config_hash="",
+            symbols=(config.symbol,),
+        )
+        self.store.append_event(session_id, evt_start)
+        self._current_seq = evt_start.seq
+        self._total_events = evt_start.seq
+
+        self.mode = RunnerMode.LIVE
         self._running = True
         self._sim_task = asyncio.create_task(self._run_simulation())
+        return session_id
 
     def stop(self) -> None:
-        """Stop the simulation task and any pending background tasks."""
+        """Stop the simulation or replay task and persist SessionEnded if live."""
+        if self.mode == RunnerMode.LIVE and self.active_session_id:
+            now_ns = self.source._clock.now_ns() if self.source else 0
+            total_evts = self.store.count_events(self.active_session_id)
+            seq = self.source.engine.allocate_seq() if self.source else total_evts + 1
+            evt_end = SessionEnded(
+                seq=seq,
+                ts_ns=now_ns,
+                symbol=self.current_config.symbol,
+                session_id=self.active_session_id,
+                reason="STOPPED_BY_USER",
+                total_events=total_evts + 1,
+            )
+            self.store.append_event(self.active_session_id, evt_end)
+            self.store.update_session(
+                self.active_session_id,
+                status="STOPPED",
+                end_ts_ns=now_ns,
+                total_events=total_evts + 1,
+            )
+
         self._running = False
         if self._sim_task is not None:
             self._sim_task.cancel()
@@ -111,13 +253,226 @@ class SimulationRunner:
         for task in self._background_tasks:
             task.cancel()
         self._background_tasks.clear()
+        self.mode = RunnerMode.STOPPED
+
+    def start_replay(
+        self,
+        session_id: str,
+        speed_multiplier: float = 1.0,
+        seek_seq: int = 1,
+    ) -> None:
+        """Start replaying a recorded simulation session."""
+        meta = self.store.get_session(session_id)
+        if meta is None:
+            raise ValueError(f"Session '{session_id}' not found")
+
+        self.stop()
+        self.active_session_id = session_id
+        self.active_session_metadata = meta
+
+        tick_size = float(meta.config.get("tick_size", 0.01))
+        initial_price = float(meta.config.get("initial_price", 150.0))
+        self.current_config = SessionConfigRequest(
+            symbol=meta.symbol,
+            seed=meta.seed,
+            tick_size=tick_size,
+            initial_price=initial_price,
+            trades_per_sec=float(meta.config.get("trades_per_sec", 50.0)),
+            volatility=float(meta.config.get("volatility", 0.20)),
+        )
+
+        self._reset_terminal_state()
+        self.replay_source = ReplayEventSource(
+            event_store=self.store,
+            session_id=session_id,
+            speed_multiplier=speed_multiplier,
+        )
+        self._total_events = meta.total_events or self.store.count_events(session_id)
+
+        if seek_seq > 1:
+            self._fast_forward(seek_seq)
+        else:
+            self.replay_source.seek(1)
+            self._current_seq = 1
+
+        self.mode = RunnerMode.REPLAY
+        self._running = True
+        self._sim_task = asyncio.create_task(self._run_replay())
+
+    def _fast_forward(self, target_seq: int) -> None:
+        """Fast-forward internal projections (OHLC, L2 depth, anomalies) to target sequence."""
+        self._reset_terminal_state()
+        events = self.store.get_events(
+            session_id=self.active_session_id,
+            from_seq=1,
+            to_seq=target_seq - 1,
+        )
+        for e in events:
+            self._process_event(e, broadcast=False)
+
+        assert self.replay_source is not None
+        self.replay_source.seek(target_seq)
+        self._current_seq = target_seq
+
+    def seek_replay(self, target_seq: int) -> None:
+        """Reposition replay progress to target sequence."""
+        if self.replay_source is None:
+            raise ValueError("No replay session initialized")
+
+        was_paused = self.mode == RunnerMode.PAUSED
+        self._fast_forward(target_seq)
+        if was_paused:
+            self.mode = RunnerMode.PAUSED
+            self.replay_source.pause()
+        else:
+            self._running = True
+            self.mode = RunnerMode.REPLAY
+            self.replay_source.resume()
+            if self._sim_task is None or self._sim_task.done():
+                self._sim_task = asyncio.create_task(self._run_replay())
+
+    def set_replay_speed(self, multiplier: float) -> None:
+        """Adjust replay playback speed multiplier."""
+        if self.replay_source is None:
+            raise ValueError("No replay session initialized")
+        self.replay_source.set_speed(multiplier)
+
+    def pause(self) -> None:
+        """Pause playback progression."""
+        if self.replay_source is not None:
+            self.mode = RunnerMode.PAUSED
+            self.replay_source.pause()
+
+    def resume(self) -> None:
+        """Resume playback progression."""
+        if self.replay_source is not None:
+            self.mode = RunnerMode.REPLAY
+            self.replay_source.resume()
+            if self._sim_task is None or self._sim_task.done():
+                self._running = True
+                self._sim_task = asyncio.create_task(self._run_replay())
+
+    def get_active_status(self) -> dict[str, Any]:
+        """Return active runner status and replay progression."""
+        if self.mode in (RunnerMode.REPLAY, RunnerMode.PAUSED) and self.replay_source is not None:
+            current_seq = self.replay_source.current_seq
+            total_events = self.replay_source.total_events
+            speed = self.replay_source.speed_multiplier
+            is_halted = self._replay_halted
+        else:
+            current_seq = self._current_seq
+            total_events = self._total_events
+            speed = 1.0
+            is_halted = self.source.engine.is_halted if self.source else False
+
+        return {
+            "mode": self.mode.value,
+            "session_id": self.active_session_id,
+            "symbol": self.current_config.symbol,
+            "current_seq": current_seq,
+            "total_events": total_events,
+            "speed_multiplier": speed,
+            "is_paused": self.mode == RunnerMode.PAUSED,
+            "latest_price": self._latest_price,
+            "is_halted": is_halted,
+        }
+
+    def _process_event(self, event: Event, broadcast: bool = True) -> None:
+        """Apply an event to terminal aggregators, book depth, anomalies, and broadcasters."""
+        if isinstance(event, TradeExecuted):
+            price = ticks_to_price(event.price_ticks, self.current_config.tick_size)
+            self._latest_price = price
+            trade_dict: dict[str, Any] = {
+                "seq": event.seq,
+                "ts_ns": event.ts_ns,
+                "symbol": event.symbol,
+                "trade_id": event.trade_id,
+                "price_ticks": event.price_ticks,
+                "price": price,
+                "qty": event.qty,
+                "aggressor_side": event.aggressor_side.value,
+            }
+            self.recent_trades.append(trade_dict)
+            if broadcast:
+                self.broadcaster.push_trade(event.symbol, trade_dict)
+
+            # Streaming anomaly detection
+            anomalies = self.anomaly_detector.on_trade(event)
+            for anom in anomalies:
+                anom_dict = anom.to_dict()
+                self.recent_anomalies.append(anom_dict)
+                if broadcast:
+                    self.broadcaster.push_anomaly(event.symbol, anom_dict)
+
+            # Incremental OHLC update
+            bar_updates = self.aggregator.update_trade(event)
+            for interval, bars in bar_updates.items():
+                for bar in bars:
+                    if broadcast:
+                        self.broadcaster.push_bar(
+                            event.symbol,
+                            interval,
+                            bar.to_dict(self.current_config.tick_size),
+                        )
+
+            # Book-level anomaly checks
+            depth = self.depth_tracker.snapshot()
+            best_bid = depth["best_bid"]
+            best_ask = depth["best_ask"]
+            bid_vol = sum(self.depth_tracker.bids.values())
+            ask_vol = sum(self.depth_tracker.asks.values())
+            book_anoms = self.anomaly_detector.on_book_update(
+                symbol=event.symbol,
+                ts_ns=event.ts_ns,
+                best_bid_ticks=best_bid,
+                best_ask_ticks=best_ask,
+                total_bid_vol=bid_vol,
+                total_ask_vol=ask_vol,
+            )
+            for anom in book_anoms:
+                anom_dict = anom.to_dict()
+                self.recent_anomalies.append(anom_dict)
+                if broadcast:
+                    self.broadcaster.push_anomaly(event.symbol, anom_dict)
+
+        elif isinstance(event, BookDelta):
+            price = ticks_to_price(event.price_ticks, self.current_config.tick_size)
+            self.depth_tracker.on_delta(event.side, event.price_ticks, event.new_total_qty)
+            delta_dict: dict[str, Any] = {
+                "seq": event.seq,
+                "ts_ns": event.ts_ns,
+                "symbol": event.symbol,
+                "side": event.side.value,
+                "price_ticks": event.price_ticks,
+                "price": price,
+                "qty": event.new_total_qty,
+            }
+            if broadcast:
+                self.broadcaster.push_book_delta(event.symbol, delta_dict)
+
+        elif isinstance(event, MarketEvent):
+            if event.kind == "HALT":
+                self._replay_halted = True
+            elif event.kind == "RESUME":
+                self._replay_halted = False
+
+            event_dict: dict[str, Any] = {
+                "seq": event.seq,
+                "ts_ns": event.ts_ns,
+                "symbol": event.symbol,
+                "kind": event.kind,
+                "params": event.params,
+            }
+            self.recent_market_events.append(event_dict)
+            if broadcast:
+                self.broadcaster.push_market_event(event.symbol, event_dict)
 
     def inject_scenario(
         self, scenario_id: str, custom_params: dict[str, Any] | None = None
     ) -> list[MarketEvent]:
-        """Inject a scenario into the running simulation."""
-        if self.source is None:
-            raise RuntimeError("Simulation not running")
+        """Inject an exogenous scenario into the live simulation and persist."""
+        if self.source is None or self.mode != RunnerMode.LIVE:
+            raise RuntimeError("Live simulation not running")
 
         params = custom_params or {}
         symbol = self.current_config.symbol
@@ -208,6 +563,7 @@ class SimulationRunner:
             for r in res:
                 if isinstance(r, MarketEvent):
                     injected.append(r)
+                    self.store.append_event(self.active_session_id, r)
         return injected
 
     async def _auto_resume(self, delay_s: float, symbol: str) -> None:
@@ -220,9 +576,11 @@ class SimulationRunner:
                 ts_ns=self.source._clock.now_ns(),
             )
             self.source.inject_market_event(evt)
+            if self.active_session_id:
+                self.store.append_event(self.active_session_id, evt)
 
     async def _run_simulation(self) -> None:
-        """Producer loop emitting simulated trades, deltas, anomalies, and OHLC updates."""
+        """Producer loop emitting and persisting simulated trades, deltas, anomalies, and bars."""
         assert self.source is not None
         interval_s = 1.0 / self.current_config.trades_per_sec
 
@@ -230,86 +588,51 @@ class SimulationRunner:
             while self._running:
                 start_t = asyncio.get_event_loop().time()
 
-                # Generate next event from agent matching pipeline
                 event = self.source.next_event()
-                if isinstance(event, TradeExecuted):
-                    price = ticks_to_price(event.price_ticks, self.current_config.tick_size)
-                    self._latest_price = price
-                    trade_dict: dict[str, Any] = {
-                        "seq": event.seq,
-                        "ts_ns": event.ts_ns,
-                        "symbol": event.symbol,
-                        "trade_id": event.trade_id,
-                        "price_ticks": event.price_ticks,
-                        "price": price,
-                        "qty": event.qty,
-                        "aggressor_side": event.aggressor_side.value,
-                    }
-                    self.recent_trades.append(trade_dict)
-                    self.broadcaster.push_trade(event.symbol, trade_dict)
+                if event is not None:
+                    # Persist event to append-only SQLite log
+                    self.store.append_event(self.active_session_id, event)
+                    self._current_seq = event.seq
+                    self._total_events = event.seq
 
-                    # Streaming anomaly detection on trade
-                    anomalies = self.anomaly_detector.on_trade(event)
-                    for anom in anomalies:
-                        anom_dict = anom.to_dict()
-                        self.recent_anomalies.append(anom_dict)
-                        self.broadcaster.push_anomaly(event.symbol, anom_dict)
-
-                    # Update incremental OHLC aggregator across all intervals
-                    bar_updates = self.aggregator.update_trade(event)
-                    for interval, bars in bar_updates.items():
-                        for bar in bars:
-                            self.broadcaster.push_bar(
-                                event.symbol,
-                                interval,
-                                bar.to_dict(self.current_config.tick_size),
-                            )
-
-                    # Book metric checks (spread blowout / imbalance)
-                    best_bid = self.source.engine.book.best_bid()
-                    best_ask = self.source.engine.book.best_ask()
-                    bid_vol = self.source.engine.book.total_volume(Side.BUY)
-                    ask_vol = self.source.engine.book.total_volume(Side.SELL)
-                    book_anomalies = self.anomaly_detector.on_book_update(
-                        symbol=event.symbol,
-                        ts_ns=event.ts_ns,
-                        best_bid_ticks=best_bid,
-                        best_ask_ticks=best_ask,
-                        total_bid_vol=bid_vol,
-                        total_ask_vol=ask_vol,
-                    )
-                    for anom in book_anomalies:
-                        anom_dict = anom.to_dict()
-                        self.recent_anomalies.append(anom_dict)
-                        self.broadcaster.push_anomaly(event.symbol, anom_dict)
-
-                elif isinstance(event, BookDelta):
-                    price = ticks_to_price(event.price_ticks, self.current_config.tick_size)
-                    delta_dict: dict[str, Any] = {
-                        "seq": event.seq,
-                        "ts_ns": event.ts_ns,
-                        "symbol": event.symbol,
-                        "side": event.side.value,
-                        "price_ticks": event.price_ticks,
-                        "price": price,
-                        "qty": event.new_total_qty,
-                    }
-                    self.broadcaster.push_book_delta(event.symbol, delta_dict)
-
-                elif isinstance(event, MarketEvent):
-                    event_dict: dict[str, Any] = {
-                        "seq": event.seq,
-                        "ts_ns": event.ts_ns,
-                        "symbol": event.symbol,
-                        "kind": event.kind,
-                        "params": event.params,
-                    }
-                    self.recent_market_events.append(event_dict)
-                    self.broadcaster.push_market_event(event.symbol, event_dict)
+                    # Update internal projection state and broadcast
+                    self._process_event(event, broadcast=True)
 
                 elapsed = asyncio.get_event_loop().time() - start_t
                 sleep_t = max(0.0, interval_s - elapsed)
                 await asyncio.sleep(sleep_t)
+        except asyncio.CancelledError:
+            pass
+
+    async def _run_replay(self) -> None:
+        """Historical replay loop streaming recorded events with pacing and seeking."""
+        assert self.replay_source is not None
+        prev_ts_ns: int | None = None
+
+        try:
+            while self._running and self.replay_source.has_next():
+                if self.mode == RunnerMode.PAUSED:
+                    await asyncio.sleep(0.05)
+                    continue
+
+                event = self.replay_source.next_event()
+                if event is None:
+                    if not self.replay_source.has_next():
+                        break
+                    await asyncio.sleep(0.01)
+                    continue
+
+                self._current_seq = event.seq
+
+                # Calculate pacing delay scaled by speed_multiplier
+                delay_s = self.replay_source.calculate_delay_s(prev_ts_ns, event.ts_ns)
+                if delay_s > 0:
+                    await asyncio.sleep(delay_s)
+
+                prev_ts_ns = event.ts_ns
+                self._process_event(event, broadcast=True)
+
+            self.mode = RunnerMode.STOPPED
         except asyncio.CancelledError:
             pass
 
@@ -319,10 +642,15 @@ def _clean_array(arr: np.ndarray) -> list[float | None]:
     return [None if np.isnan(x) else round(float(x), 4) for x in arr]
 
 
-def create_app(throttling_fps: int = 20) -> FastAPI:
+def create_app(
+    throttling_fps: int = 20,
+    store: SQLiteEventStore | None = None,
+    db_path: str = "marketpulse.db",
+) -> FastAPI:
     """Create and configure the MarketPulse FastAPI application."""
+    event_store = store if store is not None else SQLiteEventStore(db_path)
     broadcaster = Broadcaster(throttling_fps=throttling_fps)
-    sim_runner = SimulationRunner(broadcaster=broadcaster)
+    sim_runner = SimulationRunner(broadcaster=broadcaster, store=event_store)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
@@ -332,6 +660,7 @@ def create_app(throttling_fps: int = 20) -> FastAPI:
         yield
         sim_runner.stop()
         await broadcaster.stop()
+        sim_runner.store.close()
 
     app = FastAPI(
         title="MarketPulse API",
@@ -381,11 +710,16 @@ def create_app(throttling_fps: int = 20) -> FastAPI:
         """Return aggregated L2 order book depth snapshot."""
         if symbol != sim_runner.current_config.symbol:
             raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not active")
-        if sim_runner.source is None:
-            raise HTTPException(status_code=503, detail="Simulation not initialized")
 
-        snapshot = sim_runner.source.book_snapshot(max_levels=levels)
         tick_size = sim_runner.current_config.tick_size
+        if sim_runner.mode == RunnerMode.REPLAY:
+            snapshot = sim_runner.depth_tracker.snapshot(max_levels=levels)
+            is_halted = sim_runner._replay_halted
+        elif sim_runner.source is not None:
+            snapshot = sim_runner.source.book_snapshot(max_levels=levels)
+            is_halted = sim_runner.source.engine.is_halted
+        else:
+            raise HTTPException(status_code=503, detail="Simulation not initialized")
 
         bids = [
             {
@@ -428,7 +762,7 @@ def create_app(throttling_fps: int = 20) -> FastAPI:
             "spread": spread,
             "spread_ticks": spread_ticks,
             "mid_price": mid_price,
-            "is_halted": sim_runner.source.engine.is_halted if sim_runner.source else False,
+            "is_halted": is_halted,
         }
 
     @app.get("/api/v1/bars")
@@ -482,7 +816,6 @@ def create_app(throttling_fps: int = 20) -> FastAPI:
         closes = np.array([b["close"] for b in bars_data], dtype=np.float64)
         volumes = np.array([b["volume"] for b in bars_data], dtype=np.float64)
 
-        # Batch calculations
         sma20 = batch_sma(closes, period=min(20, max(1, len(closes))))
         ema20 = batch_ema(closes, period=min(20, max(1, len(closes))))
         rsi14 = batch_rsi(closes, period=min(14, max(1, len(closes) - 1)))
@@ -514,11 +847,108 @@ def create_app(throttling_fps: int = 20) -> FastAPI:
             },
         }
 
+    # --- Session Persistence & Historical Replay Endpoints ---
+
+    @app.get("/api/v1/sessions")
+    async def list_sessions(limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        """List recorded simulation sessions ordered by creation date."""
+        sessions = sim_runner.store.list_sessions(limit=limit, offset=offset)
+        return [s.to_dict() for s in sessions]
+
     @app.post("/api/v1/sessions")
     async def configure_session(req: SessionConfigRequest) -> dict[str, Any]:
-        """Configure or restart simulation session."""
-        sim_runner.start(req)
-        return {"status": "started", "config": req.model_dump()}
+        """Configure and start a new live simulation session."""
+        session_id = sim_runner.start(req)
+        return {"status": "started", "session_id": session_id, "config": req.model_dump()}
+
+    @app.get("/api/v1/sessions/active")
+    async def get_active_session() -> dict[str, Any]:
+        """Return active runner status, mode, and replay progression."""
+        return sim_runner.get_active_status()
+
+    @app.get("/api/v1/sessions/{session_id}")
+    async def get_session(session_id: str) -> dict[str, Any]:
+        """Retrieve metadata for a recorded session."""
+        meta = sim_runner.store.get_session(session_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+        return meta.to_dict()
+
+    @app.post("/api/v1/sessions/{session_id}/stop")
+    async def stop_session(session_id: str) -> dict[str, Any]:
+        """Terminate an active live or replay session."""
+        sim_runner.stop()
+        return {"status": "stopped", "session_id": session_id}
+
+    @app.post("/api/v1/sessions/{session_id}/replay")
+    async def replay_session(
+        session_id: str,
+        req: ReplayRequest | None = None,
+    ) -> dict[str, Any]:
+        """Start historical replay of a recorded session."""
+        effective_req = req or ReplayRequest()
+        try:
+            sim_runner.start_replay(
+                session_id=session_id,
+                speed_multiplier=effective_req.speed_multiplier,
+                seek_seq=effective_req.seek_seq,
+            )
+            return {
+                "status": "replaying",
+                "session_id": session_id,
+                "speed_multiplier": effective_req.speed_multiplier,
+                "seek_seq": effective_req.seek_seq,
+            }
+        except ValueError as err:
+            raise HTTPException(status_code=404, detail=str(err)) from err
+
+    @app.post("/api/v1/sessions/{session_id}/seek")
+    async def seek_session(session_id: str, req: SeekRequest) -> dict[str, Any]:
+        """Seek replay to a specific sequence number."""
+        try:
+            sim_runner.seek_replay(req.target_seq)
+            return {"status": "seeked", "target_seq": req.target_seq}
+        except ValueError as err:
+            raise HTTPException(status_code=400, detail=str(err)) from err
+
+    @app.post("/api/v1/sessions/{session_id}/speed")
+    async def set_replay_speed(session_id: str, req: SpeedRequest) -> dict[str, Any]:
+        """Update replay playback speed."""
+        try:
+            sim_runner.set_replay_speed(req.speed_multiplier)
+            return {"status": "updated", "speed_multiplier": req.speed_multiplier}
+        except ValueError as err:
+            raise HTTPException(status_code=400, detail=str(err)) from err
+
+    @app.post("/api/v1/sessions/{session_id}/pause")
+    async def pause_session(session_id: str) -> dict[str, Any]:
+        """Pause replay progression."""
+        sim_runner.pause()
+        return {"status": "paused", "session_id": session_id}
+
+    @app.post("/api/v1/sessions/{session_id}/resume")
+    async def resume_session(session_id: str) -> dict[str, Any]:
+        """Resume replay progression."""
+        sim_runner.resume()
+        return {"status": "resumed", "session_id": session_id}
+
+    @app.get("/api/v1/sessions/{session_id}/events")
+    async def get_session_events(
+        session_id: str,
+        from_seq: int = 1,
+        to_seq: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Retrieve historical sequenced events from the session log."""
+        events = sim_runner.store.get_events(
+            session_id=session_id,
+            from_seq=from_seq,
+            to_seq=to_seq,
+            limit=limit,
+        )
+        return [e.to_dict() for e in events]
+
+    # --- Scenarios & Anomaly Endpoints ---
 
     @app.get("/api/v1/scenarios")
     async def list_scenarios() -> list[dict[str, Any]]:
@@ -536,7 +966,7 @@ def create_app(throttling_fps: int = 20) -> FastAPI:
                 "events_count": len(events),
                 "is_halted": sim_runner.source.engine.is_halted if sim_runner.source else False,
             }
-        except ValueError as err:
+        except (ValueError, RuntimeError) as err:
             raise HTTPException(status_code=400, detail=str(err)) from err
 
     @app.get("/api/v1/anomalies")
@@ -548,7 +978,11 @@ def create_app(throttling_fps: int = 20) -> FastAPI:
     @app.get("/api/v1/market-status")
     async def get_market_status(symbol: str = "AAPL") -> dict[str, Any]:
         """Return market state including circuit breaker halt status."""
-        is_halted = sim_runner.source.engine.is_halted if sim_runner.source else False
+        if sim_runner.mode == RunnerMode.REPLAY:
+            is_halted = sim_runner._replay_halted
+        else:
+            is_halted = sim_runner.source.engine.is_halted if sim_runner.source else False
+
         return {
             "symbol": symbol,
             "is_halted": is_halted,

@@ -253,9 +253,7 @@ class StreamingAnomalyDetector:
             skew = abs(total_bid_qty - total_ask_qty) / total_depth
             if skew >= 0.85 and self._is_cooled_down(AnomalyType.BOOK_IMBALANCE, ts_ns):
                 dominant_side = "BUY" if total_bid_qty > total_ask_qty else "SELL"
-                severity = (
-                    AnomalySeverity.CRITICAL if skew >= 0.90 else AnomalySeverity.WARNING
-                )
+                severity = AnomalySeverity.CRITICAL if skew >= 0.90 else AnomalySeverity.WARNING
                 self._last_alert_ts[AnomalyType.BOOK_IMBALANCE] = ts_ns
                 anomalies.append(
                     MarketAnomaly(

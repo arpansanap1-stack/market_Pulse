@@ -159,5 +159,24 @@ This document records the key architectural and design decisions made throughout
 - **Alternatives Considered:**
   - Heavy ML/Isolation Forest batch detection: Incurred external dependencies, non-deterministic inference latency, and excessive memory footprint incompatible with pure Python domain core.
 
+---
+
+## ADR-014: Append-Only SQLite Event Store & Deterministic Historical Replayer
+
+- **Status:** Accepted
+- **Context:**
+  - Phase 5 requires persistence and historical session replaying.
+  - MarketPulse needs an event log capable of storing thousands of events per second with ACID guarantees, zero premature infrastructure (Rule 4: no Redis, Postgres, or external servers), and fast range queries by sequence number and timestamp.
+  - Replaying past sessions must reconstruct order book depth, OHLC candles, and indicators deterministically, while allowing sub-millisecond seeking and paced playback (`0.5x` to `10x` / `MAX`).
+- **Decision:**
+  - Implemented `SQLiteEventStore` in `marketpulse.storage.event_store` using standard library `sqlite3` in WAL mode (`PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;`).
+  - Stored events in an append-only `events` table keyed by composite primary key `(session_id, seq)` with an index on `(session_id, ts_ns)`.
+  - Implemented `ReplayEventSource` in `marketpulse.sim.replay_source` adhering to the `EventSource` protocol, with dynamic timestamp pacing (`calculate_delay_s`) scaled by `speed_multiplier` and fast-forward seek state reconstruction.
+  - Provided REST endpoints (`/api/v1/sessions`, `/replay`, `/seek`, `/speed`, `/pause`, `/resume`, `/events`, `/active`) for session management and replay control.
+- **Alternatives Considered:**
+  - Flat JSONL files: Poor random seek performance ($O(N)$ scanning required for sequence seek) and lacks ACID concurrency during high-throughput live simulation writes.
+  - PostgreSQL / TimescaleDB: Violates Working Rule 4 (premature infrastructure). SQLite stdlib provides identical query capabilities with zero setup.
+
+
 
 

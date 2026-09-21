@@ -5,6 +5,7 @@ from marketpulse.sim.agents import (
     NoiseTraderAgent,
     TrendFollowerAgent,
 )
+from marketpulse.sim.replay_source import ReplayEventSource
 from marketpulse.sim.source import (
     DeterministicSequenceSource,
     EventSource,
@@ -19,6 +20,7 @@ __all__ = [
     "EventSource",
     "MarketMakerAgent",
     "NoiseTraderAgent",
+    "ReplayEventSource",
     "StubGBMSource",
     "TrendFollowerAgent",
     "create_rng",

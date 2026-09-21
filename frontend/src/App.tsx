@@ -5,6 +5,7 @@ import { Header } from './components/Header';
 import { MarketStatsCards } from './components/MarketStats';
 import { PriceChart } from './components/PriceChart';
 import type { PriceChartHandle } from './components/PriceChart';
+import { ReplayControls } from './components/ReplayControls';
 import { ScenarioControls } from './components/ScenarioControls';
 import { TradeTape } from './components/TradeTape';
 import { MarketPulseWebSocketClient } from './services/wsClient';
@@ -17,6 +18,7 @@ import type {
   MarketStatus,
   Trade,
 } from './types/protocol';
+import type { ActiveSessionStatus, SessionMetadata } from './types/session';
 
 export const App: React.FC = () => {
   const [status, setStatus] = useState<ConnectionStatus>('CONNECTING');
@@ -27,6 +29,8 @@ export const App: React.FC = () => {
   const [anomalies, setAnomalies] = useState<MarketAnomaly[]>([]);
   const [marketStatus, setMarketStatus] = useState<MarketStatus | null>(null);
   const [rightPanelTab, setRightPanelTab] = useState<'ANOMALIES' | 'TAPE'>('ANOMALIES');
+  const [sessionStatus, setSessionStatus] = useState<ActiveSessionStatus | null>(null);
+  const [sessions, setSessions] = useState<SessionMetadata[]>([]);
 
   const [stats, setStats] = useState<MarketStats>({
     symbol: 'AAPL',
@@ -48,7 +52,31 @@ export const App: React.FC = () => {
   const currentTimeframeRef = useRef<ChartTimeframe>(currentTimeframe);
   currentTimeframeRef.current = currentTimeframe;
 
-  // Fetch initial market status
+  const fetchSessionStatus = async () => {
+    try {
+      const res = await fetch('http://localhost:8000/api/v1/sessions/active');
+      if (res.ok) {
+        const data = await res.json();
+        setSessionStatus(data);
+      }
+    } catch {
+      // ignore network errors
+    }
+  };
+
+  const fetchSessions = async () => {
+    try {
+      const res = await fetch('http://localhost:8000/api/v1/sessions?limit=50');
+      if (res.ok) {
+        const data = await res.json();
+        setSessions(data);
+      }
+    } catch {
+      // ignore network errors
+    }
+  };
+
+  // Fetch initial market status and session list
   useEffect(() => {
     fetch('http://localhost:8000/api/v1/market-status?symbol=AAPL')
       .then((res) => (res.ok ? res.json() : null))
@@ -56,7 +84,14 @@ export const App: React.FC = () => {
         if (data) setMarketStatus(data);
       })
       .catch(() => {});
+
+    fetchSessionStatus();
+    fetchSessions();
+
+    const interval = setInterval(fetchSessionStatus, 800);
+    return () => clearInterval(interval);
   }, []);
+
 
   useEffect(() => {
     const client = new MarketPulseWebSocketClient();
@@ -228,6 +263,96 @@ export const App: React.FC = () => {
     }
   };
 
+  const handleStartReplay = async (sessionId: string, speed: number = 1.0, seekSeq: number = 1) => {
+    try {
+      await fetch(`http://localhost:8000/api/v1/sessions/${sessionId}/replay`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ speed_multiplier: speed, seek_seq: seekSeq }),
+      });
+      setRecentTrades([]);
+      setBookDeltas([]);
+      setAnomalies([]);
+      await fetchSessionStatus();
+    } catch (err) {
+      console.error('Failed to start replay:', err);
+    }
+  };
+
+  const handlePauseReplay = async () => {
+    if (!sessionStatus?.session_id) return;
+    try {
+      await fetch(`http://localhost:8000/api/v1/sessions/${sessionStatus.session_id}/pause`, {
+        method: 'POST',
+      });
+      await fetchSessionStatus();
+    } catch (err) {
+      console.error('Failed to pause replay:', err);
+    }
+  };
+
+  const handleResumeReplay = async () => {
+    if (!sessionStatus?.session_id) return;
+    try {
+      await fetch(`http://localhost:8000/api/v1/sessions/${sessionStatus.session_id}/resume`, {
+        method: 'POST',
+      });
+      await fetchSessionStatus();
+    } catch (err) {
+      console.error('Failed to resume replay:', err);
+    }
+  };
+
+  const handleSeekReplay = async (targetSeq: number) => {
+    if (!sessionStatus?.session_id) return;
+    try {
+      await fetch(`http://localhost:8000/api/v1/sessions/${sessionStatus.session_id}/seek`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target_seq: targetSeq }),
+      });
+      await fetchSessionStatus();
+    } catch (err) {
+      console.error('Failed to seek replay:', err);
+    }
+  };
+
+  const handleSetReplaySpeed = async (speed: number) => {
+    if (!sessionStatus?.session_id) return;
+    try {
+      await fetch(`http://localhost:8000/api/v1/sessions/${sessionStatus.session_id}/speed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ speed_multiplier: speed }),
+      });
+      await fetchSessionStatus();
+    } catch (err) {
+      console.error('Failed to set replay speed:', err);
+    }
+  };
+
+  const handleReturnToLive = async () => {
+    try {
+      await fetch('http://localhost:8000/api/v1/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          seed: 42,
+          symbol: 'AAPL',
+          trades_per_sec: currentTps,
+          initial_price: stats.lastPrice || 150.0,
+        }),
+      });
+      setRecentTrades([]);
+      setBookDeltas([]);
+      setAnomalies([]);
+      await fetchSessionStatus();
+      await fetchSessions();
+    } catch (err) {
+      console.error('Failed to return to live mode:', err);
+    }
+  };
+
   const handleInjectScenario = async (scenarioId: string, params?: Record<string, unknown>) => {
     try {
       const res = await fetch('http://localhost:8000/api/v1/scenarios/inject', {
@@ -273,11 +398,25 @@ export const App: React.FC = () => {
         {/* Top Metric Cards */}
         <MarketStatsCards stats={stats} />
 
+        {/* Historical Session Persistence & Replay Scrubber */}
+        <ReplayControls
+          sessionStatus={sessionStatus}
+          sessions={sessions}
+          onStartReplay={handleStartReplay}
+          onPause={handlePauseReplay}
+          onResume={handleResumeReplay}
+          onSeek={handleSeekReplay}
+          onSetSpeed={handleSetReplaySpeed}
+          onReturnToLive={handleReturnToLive}
+          onRefreshSessions={fetchSessions}
+        />
+
         {/* Exogenous Market Scenarios & Circuit Breaker Launcher */}
         <ScenarioControls
           marketStatus={marketStatus}
           onInject={handleInjectScenario}
         />
+
 
         {/* Center 12-Column Grid: Chart (6) + Order Book (3) + Tabbed Panel (3) */}
         <div className="flex-1 grid grid-cols-12 gap-3.5 min-h-0">
