@@ -10,6 +10,8 @@ import type { PriceChartHandle } from './components/PriceChart';
 import { ReplayControls } from './components/ReplayControls';
 import { ScenarioControls } from './components/ScenarioControls';
 import { TradeTape } from './components/TradeTape';
+import { Watchlist } from './components/Watchlist';
+import type { WatchlistPriceItem } from './components/Watchlist';
 import { MarketPulseWebSocketClient } from './services/wsClient';
 import type { ConnectionStatus } from './services/wsClient';
 import type {
@@ -18,6 +20,7 @@ import type {
   MarketAnomaly,
   MarketStats,
   MarketStatus,
+  SymbolInfo,
   Trade,
 } from './types/protocol';
 import type { ActiveSessionStatus, SessionMetadata } from './types/session';
@@ -35,6 +38,18 @@ export const App: React.FC = () => {
   const [sessionStatus, setSessionStatus] = useState<ActiveSessionStatus | null>(null);
   const [sessions, setSessions] = useState<SessionMetadata[]>([]);
   const [portfolio, setPortfolio] = useState<PortfolioSummary | null>(null);
+  const [availableSymbols, setAvailableSymbols] = useState<SymbolInfo[]>([
+    { symbol: 'AAPL', name: 'AAPL (Simulated Equity)', tick_size: 0.01, last_price: 150.0, active: true },
+    { symbol: 'MSFT', name: 'MSFT (Simulated Equity)', tick_size: 0.01, last_price: 150.0, active: true },
+    { symbol: 'GOOGL', name: 'GOOGL (Simulated Equity)', tick_size: 0.01, last_price: 150.0, active: true },
+    { symbol: 'NVDA', name: 'NVDA (Simulated Equity)', tick_size: 0.01, last_price: 150.0, active: true },
+  ]);
+  const [watchlistPrices, setWatchlistPrices] = useState<Record<string, WatchlistPriceItem>>({
+    AAPL: { price: 150.0, change: 0, changePercent: 0 },
+    MSFT: { price: 150.0, change: 0, changePercent: 0 },
+    GOOGL: { price: 150.0, change: 0, changePercent: 0 },
+    NVDA: { price: 150.0, change: 0, changePercent: 0 },
+  });
   const [topOfBook, setTopOfBook] = useState<{ bestBid: number | null; bestAsk: number | null }>({
     bestBid: null,
     bestAsk: null,
@@ -96,9 +111,33 @@ export const App: React.FC = () => {
     }
   };
 
+  const fetchSymbols = async () => {
+    try {
+      const res = await fetch('http://localhost:8000/api/v1/symbols');
+      if (res.ok) {
+        const data: SymbolInfo[] = await res.json();
+        if (data && data.length > 0) {
+          setAvailableSymbols(data);
+          setWatchlistPrices((prev) => {
+            const next = { ...prev };
+            data.forEach((s) => {
+              if (!next[s.symbol]) {
+                next[s.symbol] = { price: s.last_price, change: 0, changePercent: 0 };
+              }
+            });
+            return next;
+          });
+        }
+      }
+    } catch {
+      // ignore network errors
+    }
+  };
+
   const fetchTopOfBook = async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/v1/book?symbol=AAPL&levels=1');
+      const sym = statsRef.current.symbol;
+      const res = await fetch(`http://localhost:8000/api/v1/book?symbol=${sym}&levels=1`);
       if (res.ok) {
         const data = await res.json();
         const tickSize = 0.01;
@@ -114,7 +153,8 @@ export const App: React.FC = () => {
 
   // Fetch initial market status and session list
   useEffect(() => {
-    fetch('http://localhost:8000/api/v1/market-status?symbol=AAPL')
+    fetchSymbols();
+    fetch(`http://localhost:8000/api/v1/market-status?symbol=${statsRef.current.symbol}`)
       .then((res) => (res.ok ? res.json() : null))
       .then((data: MarketStatus | null) => {
         if (data) setMarketStatus(data);
@@ -128,9 +168,11 @@ export const App: React.FC = () => {
 
     const interval = setInterval(fetchSessionStatus, 800);
     const bookInterval = setInterval(fetchTopOfBook, 2000);
+    const symbolsInterval = setInterval(fetchSymbols, 5000);
     return () => {
       clearInterval(interval);
       clearInterval(bookInterval);
+      clearInterval(symbolsInterval);
     };
   }, []);
 
@@ -146,20 +188,43 @@ export const App: React.FC = () => {
     const unsubscribeTrades = client.onTradesBatch((newTrades) => {
       if (newTrades.length === 0) return;
 
-      // 1. Update Lightweight Charts directly (out-of-React-state for 60fps performance)
+      // 1. Update live prices for all symbols in watchlist
+      setWatchlistPrices((prev) => {
+        const next = { ...prev };
+        for (const t of newTrades) {
+          const prevItem = next[t.symbol];
+          const base = prevItem ? (prevItem.price - prevItem.change) : t.price;
+          const diff = t.price - base;
+          const diffPercent = base > 0 ? (diff / base) * 100 : 0;
+          next[t.symbol] = {
+            price: t.price,
+            change: diff,
+            changePercent: diffPercent,
+            volume: (prevItem?.volume ?? 0) + t.qty,
+          };
+        }
+        return next;
+      });
+
+      // 2. Filter trades for the currently active symbol
+      const currentSymbol = statsRef.current.symbol;
+      const symbolTrades = newTrades.filter((t) => t.symbol === currentSymbol);
+      if (symbolTrades.length === 0) return;
+
+      // Update Lightweight Charts directly
       if (chartRef.current) {
-        chartRef.current.updateWithTrades(newTrades);
+        chartRef.current.updateWithTrades(symbolTrades);
       }
 
-      // 2. Update stats and tape in throttled React state
-      const latestTrade = newTrades[newTrades.length - 1];
+      // Update stats and tape in throttled React state
+      const latestTrade = symbolTrades[symbolTrades.length - 1];
       const prevStats = statsRef.current;
 
       let newHigh = prevStats.high;
       let newLow = prevStats.low;
       let batchVolume = 0;
 
-      for (const t of newTrades) {
+      for (const t of symbolTrades) {
         if (t.price > newHigh) newHigh = t.price;
         if (t.price < newLow) newLow = t.price;
         batchVolume += t.qty;
@@ -176,12 +241,12 @@ export const App: React.FC = () => {
         high: newHigh,
         low: newLow,
         volume: prevStats.volume + batchVolume,
-        tradesCount: prevStats.tradesCount + newTrades.length,
+        tradesCount: prevStats.tradesCount + symbolTrades.length,
       });
 
       // Update capped trade tape (keep last 50 trades)
       setRecentTrades((prev) => {
-        const combined = [...newTrades, ...prev];
+        const combined = [...symbolTrades, ...prev];
         return combined.slice(0, 50);
       });
     });
@@ -193,25 +258,33 @@ export const App: React.FC = () => {
     });
 
     const unsubscribeBook = client.onBookBatch((deltas) => {
-      setBookDeltas(deltas);
+      const currentSymbol = statsRef.current.symbol;
+      const symbolDeltas = deltas.filter((d) => d.symbol === currentSymbol);
+      if (symbolDeltas.length > 0) {
+        setBookDeltas(symbolDeltas);
+      }
     });
 
     const unsubscribeAnomalies = client.onAnomaliesBatch((newAnoms) => {
-      setAnomalies((prev) => [...newAnoms, ...prev].slice(0, 100));
+      const currentSymbol = statsRef.current.symbol;
+      const symbolAnoms = newAnoms.filter((a) => a.symbol === currentSymbol);
+      if (symbolAnoms.length > 0) {
+        setAnomalies((prev) => [...symbolAnoms, ...prev].slice(0, 100));
+      }
     });
 
     const unsubscribeMarketEvents = client.onMarketEventsBatch((events) => {
       for (const evt of events) {
         if (evt.kind === 'HALT') {
           setMarketStatus((prev) => ({
-            symbol: prev?.symbol || 'AAPL',
+            symbol: prev?.symbol || statsRef.current.symbol,
             latest_price: prev?.latest_price || statsRef.current.lastPrice,
             is_halted: true,
             status: 'HALTED',
           }));
         } else if (evt.kind === 'RESUME') {
           setMarketStatus((prev) => ({
-            symbol: prev?.symbol || 'AAPL',
+            symbol: prev?.symbol || statsRef.current.symbol,
             latest_price: prev?.latest_price || statsRef.current.lastPrice,
             is_halted: false,
             status: 'ACTIVE',
@@ -224,8 +297,10 @@ export const App: React.FC = () => {
       setPortfolio(newPortfolio);
     });
 
-    // Subscribe to symbol trades, order book, bar interval, anomalies, and events
-    client.subscribe('trades:AAPL');
+    // Subscribe to symbol trades for all symbols so watchlist ticks live
+    ['AAPL', 'MSFT', 'GOOGL', 'NVDA'].forEach((sym) => {
+      client.subscribe(`trades:${sym}`);
+    });
     client.subscribe('book:AAPL');
     client.subscribe(`bars:AAPL:${currentTimeframeRef.current}`);
     client.subscribe('anomalies:AAPL');
@@ -245,6 +320,57 @@ export const App: React.FC = () => {
       clientRef.current = null;
     };
   }, []);
+
+  const handleSelectSymbol = (newSymbol: string) => {
+    if (newSymbol === stats.symbol) return;
+    const oldSymbol = stats.symbol;
+    if (clientRef.current) {
+      clientRef.current.unsubscribe(`book:${oldSymbol}`);
+      clientRef.current.unsubscribe(`bars:${oldSymbol}:${currentTimeframeRef.current}`);
+      clientRef.current.unsubscribe(`anomalies:${oldSymbol}`);
+
+      clientRef.current.subscribe(`book:${newSymbol}`);
+      clientRef.current.subscribe(`bars:${newSymbol}:${currentTimeframeRef.current}`);
+      clientRef.current.subscribe(`anomalies:${newSymbol}`);
+    }
+
+    const currentPrice = watchlistPrices[newSymbol]?.price ?? 150.0;
+    setStats({
+      symbol: newSymbol,
+      lastPrice: currentPrice,
+      previousClose: currentPrice,
+      change: 0.0,
+      changePercent: 0.0,
+      high: currentPrice,
+      low: currentPrice,
+      volume: 0,
+      tradesCount: 0,
+      tradesPerSec: currentTps,
+    });
+    setRecentTrades([]);
+    setBookDeltas([]);
+    setAnomalies([]);
+
+    fetch(`http://localhost:8000/api/v1/book?symbol=${newSymbol}&levels=10`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data) {
+          const tickSize = 0.01;
+          setTopOfBook({
+            bestBid: data.best_bid ? Number((data.best_bid * tickSize).toFixed(2)) : null,
+            bestAsk: data.best_ask ? Number((data.best_ask * tickSize).toFixed(2)) : null,
+          });
+        }
+      })
+      .catch(() => {});
+
+    fetch(`http://localhost:8000/api/v1/market-status?symbol=${newSymbol}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data) setMarketStatus(data);
+      })
+      .catch(() => {});
+  };
 
   const handleTimeframeChange = (newTf: ChartTimeframe) => {
     if (clientRef.current) {
@@ -437,12 +563,22 @@ export const App: React.FC = () => {
         stats={stats}
         currentTps={currentTps}
         isHalted={marketStatus?.is_halted}
+        availableSymbols={availableSymbols.map((s) => s.symbol)}
+        onSelectSymbol={handleSelectSymbol}
         onSetSimulationSpeed={handleSetSpeed}
         onResetSession={handleResetSession}
       />
 
       {/* Main Terminal Workspace Layout */}
       <div className="flex-1 flex flex-col p-4 gap-3.5 overflow-y-auto min-h-0">
+        {/* Real-time Multi-Asset Watchlist Ribbon */}
+        <Watchlist
+          symbols={availableSymbols}
+          selectedSymbol={stats.symbol}
+          onSelectSymbol={handleSelectSymbol}
+          prices={watchlistPrices}
+        />
+
         {/* Top Metric Cards */}
         <MarketStatsCards stats={stats} />
 

@@ -294,3 +294,32 @@ def test_anomalies_and_websocket_events_subscription(client: TestClient) -> None
         ack2 = json.loads(ws.receive_text())
         assert ack2["type"] == "ACK"
         assert ack2["channel"] == "events:market"
+
+
+def test_multisymbol_session_and_symbols_endpoint(client: TestClient) -> None:
+    """Verify concurrent multi-symbol simulation exposes all active symbols."""
+    res = client.post(
+        "/api/v1/sessions",
+        json={
+            "seed": 42,
+            "symbols": ["AAPL", "MSFT", "GOOGL"],
+            "trades_per_sec": 50.0,
+            "initial_price": 150.0,
+        },
+    )
+    assert res.status_code == 200
+
+    symbols_res = client.get("/api/v1/symbols")
+    assert symbols_res.status_code == 200
+    data = symbols_res.json()
+    symbols_list = [s["symbol"] for s in data]
+    assert "AAPL" in symbols_list
+    assert "MSFT" in symbols_list
+    assert "GOOGL" in symbols_list
+
+    # Verify per-symbol books are available
+    for sym in ("AAPL", "MSFT", "GOOGL"):
+        book_res = client.get(f"/api/v1/book?symbol={sym}&levels=5")
+        assert book_res.status_code == 200
+        assert book_res.json()["symbol"] == sym
+

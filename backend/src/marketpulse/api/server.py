@@ -59,6 +59,7 @@ from marketpulse.core.scenarios import (
     get_available_scenarios,
 )
 from marketpulse.sim.agent_source import AgentOrderSource
+from marketpulse.sim.multiplex_source import MultiplexedAgentSource
 from marketpulse.sim.replay_source import ReplayEventSource
 from marketpulse.storage.event_store import SessionMetadata, SQLiteEventStore
 
@@ -78,11 +79,19 @@ class SessionConfigRequest(BaseModel):
     """Request payload to configure or restart a simulation session."""
 
     seed: int = Field(default=42, ge=0)
-    symbol: str = Field(default="AAPL")
+    symbol: str | None = Field(default=None)
+    symbols: list[str] = Field(default_factory=lambda: ["AAPL", "MSFT", "GOOGL", "NVDA"])
     trades_per_sec: float = Field(default=50.0, gt=0, le=5000.0)
     initial_price: float = Field(default=150.0, gt=0)
     volatility: float = Field(default=0.20, gt=0)
     tick_size: float = Field(default=0.01, gt=0)
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.symbol is not None:
+            if "symbols" not in self.model_fields_set:
+                self.symbols = [self.symbol]
+        elif self.symbols:
+            self.symbol = self.symbols[0]
 
 
 class ScenarioInjectRequest(BaseModel):
@@ -197,19 +206,19 @@ class SimulationRunner:
         self.recent_trades: deque[dict[str, Any]] = deque(maxlen=max_history)
         self.recent_anomalies: deque[dict[str, Any]] = deque(maxlen=max_history)
         self.recent_market_events: deque[dict[str, Any]] = deque(maxlen=max_history)
-        self.depth_tracker: ReplayDepthTracker = ReplayDepthTracker()
         self.current_config = SessionConfigRequest()
-        self.source: AgentOrderSource | None = None
+        self.source: MultiplexedAgentSource | None = None
         self.replay_source: ReplayEventSource | None = None
-        self.aggregator: OHLCAggregator = OHLCAggregator(symbol="AAPL")
-        self.anomaly_detector: StreamingAnomalyDetector = StreamingAnomalyDetector(symbol="AAPL")
+        self.aggregators: dict[str, OHLCAggregator] = {}
+        self.anomaly_detectors: dict[str, StreamingAnomalyDetector] = {}
         self.portfolio: PortfolioTracker = PortfolioTracker()
-        self.advanced_orders: AdvancedOrderManager = AdvancedOrderManager()
+        self.advanced_orders: dict[str, AdvancedOrderManager] = {}
+        self.depth_trackers: dict[str, ReplayDepthTracker] = {}
         self._sim_task: asyncio.Task[None] | None = None
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._running: bool = False
         self._replay_halted: bool = False
-        self._latest_price: float = 150.0
+        self._latest_prices: dict[str, float] = {}
         self._current_seq: int = 0
         self._total_events: int = 0
 
@@ -218,13 +227,19 @@ class SimulationRunner:
         self.recent_trades.clear()
         self.recent_anomalies.clear()
         self.recent_market_events.clear()
-        self.depth_tracker.clear()
+        self.depth_trackers.clear()
         self._replay_halted = False
-        self.aggregator = OHLCAggregator(symbol=self.current_config.symbol)
-        self.anomaly_detector = StreamingAnomalyDetector(symbol=self.current_config.symbol)
-        self.portfolio.reset(initial_cash=100_000.0, tick_size=self.current_config.tick_size)
+        self.aggregators.clear()
+        self.anomaly_detectors.clear()
         self.advanced_orders.clear()
-        self._latest_price = self.current_config.initial_price
+        self._latest_prices.clear()
+        self.portfolio.reset(initial_cash=100_000.0, tick_size=self.current_config.tick_size)
+        for sym in self.current_config.symbols:
+            self.aggregators[sym] = OHLCAggregator(symbol=sym)
+            self.anomaly_detectors[sym] = StreamingAnomalyDetector(symbol=sym)
+            self.advanced_orders[sym] = AdvancedOrderManager()
+            self.depth_trackers[sym] = ReplayDepthTracker()
+            self._latest_prices[sym] = self.current_config.initial_price
 
     def start(self, config: SessionConfigRequest) -> str:
         """Start or restart a live simulation session with event log persistence."""
@@ -235,18 +250,20 @@ class SimulationRunner:
         session_id = f"sess_{uuid.uuid4().hex[:12]}"
         self.active_session_id = session_id
 
-        self.source = AgentOrderSource(
+        self.source = MultiplexedAgentSource(
             seed=config.seed,
-            symbol=config.symbol,
+            symbols=tuple(config.symbols),
             initial_price=config.initial_price,
             tick_size=config.tick_size,
+            time_step_s=1.0 / config.trades_per_sec,
         )
         self.portfolio.reset(initial_cash=100_000.0, tick_size=config.tick_size)
 
-        start_ts_ns = self.source._clock.now_ns()
+        primary_symbol = config.symbol or (config.symbols[0] if config.symbols else "AAPL")
+        start_ts_ns = self.source._clock.now_ns() if self.source and self.source._clock else 0
         self.active_session_metadata = self.store.create_session(
             session_id=session_id,
-            symbol=config.symbol,
+            symbol=primary_symbol,
             seed=config.seed,
             config=config.model_dump(),
             start_ts_ns=start_ts_ns,
@@ -254,13 +271,13 @@ class SimulationRunner:
 
         # Log canonical SessionStarted event
         evt_start = SessionStarted(
-            seq=self.source.engine.allocate_seq(),
+            seq=self.source.get_engine(primary_symbol).allocate_seq() if self.source and config.symbols else 1,
             ts_ns=start_ts_ns,
-            symbol=config.symbol,
+            symbol=primary_symbol,
             session_id=session_id,
             seed=config.seed,
             config_hash="",
-            symbols=(config.symbol,),
+            symbols=tuple(config.symbols),
         )
         self.store.append_event(session_id, evt_start)
         self._current_seq = evt_start.seq
@@ -274,13 +291,14 @@ class SimulationRunner:
     def stop(self) -> None:
         """Stop the simulation or replay task and persist SessionEnded if live."""
         if self.mode == RunnerMode.LIVE and self.active_session_id:
-            now_ns = self.source._clock.now_ns() if self.source else 0
+            now_ns = self.source._clock.now_ns() if self.source and self.source._clock else 0
             total_evts = self.store.count_events(self.active_session_id)
-            seq = self.source.engine.allocate_seq() if self.source else total_evts + 1
+            primary_symbol = self.current_config.symbol or (self.current_config.symbols[0] if self.current_config.symbols else "AAPL")
+            seq = self.source.get_engine(primary_symbol).allocate_seq() if self.source and self.current_config.symbols else total_evts + 1
             evt_end = SessionEnded(
                 seq=seq,
                 ts_ns=now_ns,
-                symbol=self.current_config.symbol,
+                symbol=primary_symbol,
                 session_id=self.active_session_id,
                 reason="STOPPED_BY_USER",
                 total_events=total_evts + 1,
@@ -319,8 +337,11 @@ class SimulationRunner:
 
         tick_size = float(meta.config.get("tick_size", 0.01))
         initial_price = float(meta.config.get("initial_price", 150.0))
+        meta_symbols = meta.config.get("symbols")
+        if not meta_symbols:
+            meta_symbols = [meta.symbol] if meta.symbol else ["AAPL"]
         self.current_config = SessionConfigRequest(
-            symbol=meta.symbol,
+            symbols=list(meta_symbols),
             seed=meta.seed,
             tick_size=tick_size,
             initial_price=initial_price,
@@ -410,17 +431,19 @@ class SimulationRunner:
             current_seq = self._current_seq
             total_events = self._total_events
             speed = 1.0
-            is_halted = self.source.engine.is_halted if self.source else False
+            is_halted = any(self.source.get_engine(s).is_halted for s in self.current_config.symbols) if self.source else False
 
+        primary_symbol = self.current_config.symbol or (self.current_config.symbols[0] if self.current_config.symbols else "AAPL")
         return {
             "mode": self.mode.value,
             "session_id": self.active_session_id,
-            "symbol": self.current_config.symbol,
+            "symbol": primary_symbol,
+            "symbols": self.current_config.symbols,
             "current_seq": current_seq,
             "total_events": total_events,
             "speed_multiplier": speed,
             "is_paused": self.mode == RunnerMode.PAUSED,
-            "latest_price": self._latest_price,
+            "latest_prices": self._latest_prices,
             "is_halted": is_halted,
         }
 
@@ -428,7 +451,7 @@ class SimulationRunner:
         """Apply an event to terminal aggregators, book depth, anomalies, and broadcasters."""
         if isinstance(event, TradeExecuted):
             price = ticks_to_price(event.price_ticks, self.current_config.tick_size)
-            self._latest_price = price
+            self._latest_prices[event.symbol] = price
             trade_dict: dict[str, Any] = {
                 "seq": event.seq,
                 "ts_ns": event.ts_ns,
@@ -450,7 +473,7 @@ class SimulationRunner:
                 self.portfolio.on_trade_executed(event, event.buy_order_id, Side.BUY)
                 p_buy = self.portfolio.orders[event.buy_order_id]
                 if p_buy.status == OrderStatus.FILLED:
-                    oco_cancels = self.advanced_orders.on_order_filled(event.buy_order_id)
+                    oco_cancels = self.advanced_orders[event.symbol].on_order_filled(event.buy_order_id)
                     for cancel_id in oco_cancels:
                         self._cancel_oco_companion(cancel_id, event.ts_ns, event.symbol)
                 if broadcast:
@@ -464,7 +487,7 @@ class SimulationRunner:
                 self.portfolio.on_trade_executed(event, event.sell_order_id, Side.SELL)
                 p_sell = self.portfolio.orders[event.sell_order_id]
                 if p_sell.status == OrderStatus.FILLED:
-                    oco_cancels = self.advanced_orders.on_order_filled(event.sell_order_id)
+                    oco_cancels = self.advanced_orders[event.symbol].on_order_filled(event.sell_order_id)
                     for cancel_id in oco_cancels:
                         self._cancel_oco_companion(cancel_id, event.ts_ns, event.symbol)
                 if broadcast:
@@ -477,11 +500,11 @@ class SimulationRunner:
 
             # Evaluate synthetic trigger orders (Phase 8A)
             if self.mode == RunnerMode.LIVE and self.source is not None:
-                activated, oco_cancels, stops = self.advanced_orders.on_trade(
+                activated, oco_cancels, stops = self.advanced_orders[event.symbol].on_trade(
                     trade_price_ticks=event.price_ticks,
                     ts_ns=event.ts_ns,
                     symbol=event.symbol,
-                    seq_fn=self.source.engine.allocate_seq,
+                    seq_fn=self.source.get_engine(event.symbol).allocate_seq,
                 )
                 for ord_id, new_stop in stops:
                     self.portfolio.update_stop_price(ord_id, new_stop, event.ts_ns)
@@ -499,7 +522,7 @@ class SimulationRunner:
                     self.store.append_event(self.active_session_id, sub_evt)
                     self._current_seq = sub_evt.seq
                     self._total_events = sub_evt.seq
-                    matching_events = self.source.engine.submit_order(sub_evt)
+                    matching_events = self.source.get_engine(event.symbol).submit_order(sub_evt)
                     for m_evt in matching_events:
                         self.store.append_event(self.active_session_id, m_evt)
                         self._current_seq = m_evt.seq
@@ -530,7 +553,7 @@ class SimulationRunner:
                     self.broadcaster.push_portfolio(summary)
 
             # Streaming anomaly detection
-            anomalies = self.anomaly_detector.on_trade(event)
+            anomalies = self.anomaly_detectors[event.symbol].on_trade(event)
             for anom in anomalies:
                 anom_dict = anom.to_dict()
                 self.recent_anomalies.append(anom_dict)
@@ -538,7 +561,7 @@ class SimulationRunner:
                     self.broadcaster.push_anomaly(event.symbol, anom_dict)
 
             # Incremental OHLC update
-            bar_updates = self.aggregator.update_trade(event)
+            bar_updates = self.aggregators[event.symbol].update_trade(event)
             for interval, bars in bar_updates.items():
                 for bar in bars:
                     if broadcast:
@@ -549,12 +572,12 @@ class SimulationRunner:
                         )
 
             # Book-level anomaly checks
-            depth = self.depth_tracker.snapshot()
+            depth = self.depth_trackers[event.symbol].snapshot()
             best_bid = depth["best_bid"]
             best_ask = depth["best_ask"]
-            bid_vol = sum(self.depth_tracker.bids.values())
-            ask_vol = sum(self.depth_tracker.asks.values())
-            book_anoms = self.anomaly_detector.on_book_update(
+            bid_vol = sum(self.depth_trackers[event.symbol].bids.values())
+            ask_vol = sum(self.depth_trackers[event.symbol].asks.values())
+            book_anoms = self.anomaly_detectors[event.symbol].on_book_update(
                 symbol=event.symbol,
                 ts_ns=event.ts_ns,
                 best_bid_ticks=best_bid,
@@ -570,7 +593,7 @@ class SimulationRunner:
 
         elif isinstance(event, BookDelta):
             price = ticks_to_price(event.price_ticks, self.current_config.tick_size)
-            self.depth_tracker.on_delta(event.side, event.price_ticks, event.new_total_qty)
+            self.depth_trackers[event.symbol].on_delta(event.side, event.price_ticks, event.new_total_qty)
             delta_dict: dict[str, Any] = {
                 "seq": event.seq,
                 "ts_ns": event.ts_ns,
@@ -607,7 +630,7 @@ class SimulationRunner:
         p_order = self.portfolio.orders[cancel_id]
         if p_order.status == OrderStatus.UNTRIGGERED:
             if self.source is not None:
-                seq = self.source.engine.allocate_seq()
+                seq = self.source.get_engine(symbol).allocate_seq()
             else:
                 self._current_seq += 1
                 seq = self._current_seq
@@ -628,7 +651,7 @@ class SimulationRunner:
             OrderStatus.PARTIALLY_FILLED,
         ):
             if self.source is not None:
-                engine_cancels = self.source.engine.cancel_order(
+                engine_cancels = self.source.get_engine(symbol).cancel_order(
                     cancel_id, ts_ns=ts_ns, reason="OCO_TRIGGERED"
                 )
                 for ce in engine_cancels:
@@ -647,8 +670,8 @@ class SimulationRunner:
             raise RuntimeError("Live simulation not running")
 
         params = custom_params or {}
-        symbol = self.current_config.symbol
-        clock_ns = self.source._clock.now_ns()
+        symbol = str(params.get("symbol", self.current_config.symbols[0]))
+        clock_ns = self.source._clock.now_ns() if self.source is not None and self.source._clock is not None else 0
         events_to_inject: list[MarketEvent] = []
 
         if scenario_id in ("earnings_shock_positive", "earnings_shock_negative", "earnings_shock"):
@@ -664,7 +687,7 @@ class SimulationRunner:
             evt = create_earnings_shock(
                 symbol=symbol,
                 jump_pct=jump_pct,
-                seq=self.source.engine.allocate_seq(),
+                seq=self.source.get_engine(symbol).allocate_seq(),
                 ts_ns=clock_ns,
                 volatility_mult=vol_mult,
             )
@@ -675,14 +698,14 @@ class SimulationRunner:
             evt_shock = create_earnings_shock(
                 symbol=symbol,
                 jump_pct=crash_pct,
-                seq=self.source.engine.allocate_seq(),
+                seq=self.source.get_engine(symbol).allocate_seq(),
                 ts_ns=clock_ns,
                 volatility_mult=3.0,
             )
             evt_halt = create_halt_event(
                 symbol=symbol,
                 reason="CIRCUIT_BREAKER_LULD",
-                seq=self.source.engine.allocate_seq(),
+                seq=self.source.get_engine(symbol).allocate_seq(),
                 ts_ns=clock_ns,
             )
             events_to_inject.extend([evt_shock, evt_halt])
@@ -706,7 +729,7 @@ class SimulationRunner:
                 symbol=symbol,
                 regime=regime,
                 multiplier=mult,
-                seq=self.source.engine.allocate_seq(),
+                seq=self.source.get_engine(symbol).allocate_seq(),
                 ts_ns=clock_ns,
             )
             events_to_inject.append(evt)
@@ -715,14 +738,14 @@ class SimulationRunner:
             evt = create_halt_event(
                 symbol=symbol,
                 reason=reason,
-                seq=self.source.engine.allocate_seq(),
+                seq=self.source.get_engine(symbol).allocate_seq(),
                 ts_ns=clock_ns,
             )
             events_to_inject.append(evt)
         elif scenario_id in ("resume_trading", "resume"):
             evt = create_resume_event(
                 symbol=symbol,
-                seq=self.source.engine.allocate_seq(),
+                seq=self.source.get_engine(symbol).allocate_seq(),
                 ts_ns=clock_ns,
             )
             events_to_inject.append(evt)
@@ -731,7 +754,7 @@ class SimulationRunner:
 
         injected: list[MarketEvent] = []
         for e in events_to_inject:
-            res = self.source.inject_market_event(e)
+            res = self.source.get_source(symbol).inject_market_event(e)
             for r in res:
                 if isinstance(r, MarketEvent):
                     injected.append(r)
@@ -743,7 +766,7 @@ class SimulationRunner:
         if self.mode != RunnerMode.LIVE or self.source is None:
             raise RuntimeError("Live simulation is not running")
 
-        if self.source.engine.is_halted:
+        if self.source.get_engine(req.symbol).is_halted:
             raise RuntimeError("Market is currently halted by circuit breaker")
 
         tick_size = self.current_config.tick_size
@@ -763,7 +786,7 @@ class SimulationRunner:
             est_ticks = price_ticks
         else:
             price_ticks = None
-            est_ticks = price_to_ticks(self._latest_price, tick_size)
+            est_ticks = price_to_ticks(self._latest_prices.get(req.symbol, 150.0), tick_size)
 
         # Validate stop price
         if req.order_type in (
@@ -804,8 +827,8 @@ class SimulationRunner:
             raise ValueError(err or "Order validation failed")
 
         order_id = f"usr_{uuid.uuid4().hex[:8]}"
-        seq = self.source.engine.allocate_seq()
-        ts_ns = self.source._clock.now_ns()
+        seq = self.source.get_engine(req.symbol).allocate_seq()
+        ts_ns = self.source._clock.now_ns() if self.source and self.source._clock else 0
 
         order_evt = OrderSubmitted(
             seq=seq,
@@ -847,13 +870,13 @@ class SimulationRunner:
                 tif=req.tif,
                 created_ts_ns=ts_ns,
             )
-            self.advanced_orders.register_order(trigger_ord)
+            self.advanced_orders[req.symbol].register_order(trigger_ord)
         else:
             if req.oco_group_id:
-                self.advanced_orders.register_oco_member(order_id, req.oco_group_id)
+                self.advanced_orders[req.symbol].register_oco_member(order_id, req.oco_group_id)
 
             # Submit active Limit/Market order to matching engine
-            matching_events = self.source.engine.submit_order(order_evt)
+            matching_events = self.source.get_engine(req.symbol).submit_order(order_evt)
             for evt in matching_events:
                 self.store.append_event(self.active_session_id, evt)
                 self._current_seq = evt.seq
@@ -866,7 +889,7 @@ class SimulationRunner:
                     self.portfolio.on_order_canceled(evt)
                 self._process_event(evt, broadcast=True)
 
-        current_ticks = price_to_ticks(self._latest_price, tick_size)
+        current_ticks = price_to_ticks(self._latest_prices.get(req.symbol, 150.0), tick_size)
         summary = self.portfolio.get_summary(current_ticks, tick_size, req.symbol)
         self.broadcaster.push_portfolio(summary)
 
@@ -914,14 +937,14 @@ class SimulationRunner:
         ):
             raise ValueError(f"Cannot cancel order in status '{order.status.value}'")
 
-        ts_ns = self.source._clock.now_ns()
+        ts_ns = self.source._clock.now_ns() if self.source and self.source._clock else 0
 
         if order.status == OrderStatus.UNTRIGGERED:
-            canceled_ids = self.advanced_orders.cancel_order(order_id)
+            canceled_ids = self.advanced_orders[order.symbol].cancel_order(order_id)
             for cid in canceled_ids:
                 self._cancel_oco_companion(cid, ts_ns, order.symbol)
         else:
-            cancel_events = self.source.engine.cancel_order(
+            cancel_events = self.source.get_engine(order.symbol).cancel_order(
                 order_id, ts_ns=ts_ns, reason="USER_REQUESTED"
             )
             for evt in cancel_events:
@@ -933,13 +956,13 @@ class SimulationRunner:
                 self._process_event(evt, broadcast=True)
 
             # Check if order had OCO companions to cancel in OMS
-            peers = self.advanced_orders.cancel_order(order_id)
+            peers = self.advanced_orders[order.symbol].cancel_order(order_id)
             for peer_id in peers:
                 if peer_id != order_id:
                     self._cancel_oco_companion(peer_id, ts_ns, order.symbol)
 
         tick_size = self.current_config.tick_size
-        current_ticks = price_to_ticks(self._latest_price, tick_size)
+        current_ticks = price_to_ticks(self._latest_prices.get(order.symbol, 150.0), tick_size)
         summary = self.portfolio.get_summary(current_ticks, tick_size, order.symbol)
         self.broadcaster.push_portfolio(summary)
 
@@ -948,13 +971,13 @@ class SimulationRunner:
     async def _auto_resume(self, delay_s: float, symbol: str) -> None:
         """Automatically resume trading after circuit breaker halt."""
         await asyncio.sleep(delay_s)
-        if self._running and self.source is not None and self.source.engine.is_halted:
+        if self._running and self.source is not None and self.source.get_engine(symbol).is_halted:
             evt = create_resume_event(
                 symbol=symbol,
-                seq=self.source.engine.allocate_seq(),
-                ts_ns=self.source._clock.now_ns(),
+                seq=self.source.get_engine(symbol).allocate_seq(),
+                ts_ns=self.source._clock.now_ns() if self.source and self.source._clock else 0,
             )
-            self.source.inject_market_event(evt)
+            self.source.get_source(symbol).inject_market_event(evt)
             if self.active_session_id:
                 self.store.append_event(self.active_session_id, evt)
 
@@ -1067,12 +1090,13 @@ def create_app(
         cfg = sim_runner.current_config
         return [
             {
-                "symbol": cfg.symbol,
-                "name": f"{cfg.symbol} (Simulated Equity)",
+                "symbol": sym,
+                "name": f"{sym} (Simulated Equity)",
                 "tick_size": cfg.tick_size,
-                "last_price": sim_runner._latest_price,
+                "last_price": sim_runner._latest_prices.get(sym, cfg.initial_price),
                 "active": True,
             }
+            for sym in cfg.symbols
         ]
 
     @app.get("/api/v1/trades")
@@ -1087,16 +1111,19 @@ def create_app(
         levels: int = 10,
     ) -> dict[str, Any]:
         """Return aggregated L2 order book depth snapshot."""
-        if symbol != sim_runner.current_config.symbol:
+        if symbol not in sim_runner.current_config.symbols:
             raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not active")
 
         tick_size = sim_runner.current_config.tick_size
         if sim_runner.mode == RunnerMode.REPLAY:
-            snapshot = sim_runner.depth_tracker.snapshot(max_levels=levels)
+            dt = sim_runner.depth_trackers.get(symbol)
+            snapshot = dt.snapshot(max_levels=levels) if dt else {
+                "bids": [], "asks": [], "best_bid": None, "best_ask": None, "spread": None, "mid_price_ticks": None
+            }
             is_halted = sim_runner._replay_halted
         elif sim_runner.source is not None:
-            snapshot = sim_runner.source.book_snapshot(max_levels=levels)
-            is_halted = sim_runner.source.engine.is_halted
+            snapshot = sim_runner.source.get_source(symbol).book_snapshot(max_levels=levels)
+            is_halted = sim_runner.source.get_engine(symbol).is_halted
         else:
             raise HTTPException(status_code=503, detail="Simulation not initialized")
 
@@ -1151,18 +1178,22 @@ def create_app(
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         """Return historical and current bars for a symbol and interval."""
-        if symbol != sim_runner.current_config.symbol:
+        if symbol not in sim_runner.current_config.symbols:
             raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not active")
 
+        agg = sim_runner.aggregators.get(symbol)
+        if agg is None:
+            return []
+
         try:
-            closed_bars = sim_runner.aggregator.get_history(interval, limit=limit)
+            closed_bars = agg.get_history(interval, limit=limit)
         except ValueError as err:
             raise HTTPException(status_code=400, detail=str(err)) from err
 
         tick_size = sim_runner.current_config.tick_size
         results = [b.to_dict(tick_size) for b in closed_bars]
 
-        current_bar = sim_runner.aggregator.get_current_bar(interval)
+        current_bar = agg.get_current_bar(interval)
         if current_bar is not None:
             results.append(current_bar.to_dict(tick_size))
 
@@ -1343,7 +1374,11 @@ def create_app(
                 "status": "injected",
                 "scenario_id": req.scenario_id,
                 "events_count": len(events),
-                "is_halted": sim_runner.source.engine.is_halted if sim_runner.source else False,
+                "is_halted": (
+                    sim_runner.source.get_engine(req.symbol).is_halted
+                    if sim_runner.source and req.symbol in sim_runner.current_config.symbols
+                    else False
+                ),
             }
         except (ValueError, RuntimeError) as err:
             raise HTTPException(status_code=400, detail=str(err)) from err
@@ -1360,11 +1395,15 @@ def create_app(
         if sim_runner.mode == RunnerMode.REPLAY:
             is_halted = sim_runner._replay_halted
         else:
-            is_halted = sim_runner.source.engine.is_halted if sim_runner.source else False
+            is_halted = (
+                sim_runner.source.get_engine(symbol).is_halted
+                if (sim_runner.source and symbol in sim_runner.current_config.symbols)
+                else False
+            )
 
         stp_stats = (
-            sim_runner.source.engine.get_stp_stats()
-            if (sim_runner.source and sim_runner.mode == RunnerMode.LIVE)
+            sim_runner.source.get_engine(symbol).get_stp_stats()
+            if (sim_runner.source and sim_runner.mode == RunnerMode.LIVE and symbol in sim_runner.current_config.symbols)
             else {
                 "cancel_newest": 0,
                 "cancel_oldest": 0,
@@ -1377,7 +1416,7 @@ def create_app(
             "symbol": symbol,
             "is_halted": is_halted,
             "status": "HALTED" if is_halted else "ACTIVE",
-            "latest_price": sim_runner._latest_price,
+            "latest_price": sim_runner._latest_prices.get(symbol, 150.0),
             "stp_stats": stp_stats,
         }
 
@@ -1429,14 +1468,15 @@ def create_app(
         return order.to_dict(sim_runner.current_config.tick_size)
 
     @app.get("/api/v1/portfolio")
-    async def get_portfolio() -> dict[str, Any]:
+    async def get_portfolio(symbol: str = "AAPL") -> dict[str, Any]:
         """Return paper trading account balance, equity, and position inventory."""
         tick_size = sim_runner.current_config.tick_size
-        current_ticks = price_to_ticks(sim_runner._latest_price, tick_size)
+        current_price = sim_runner._latest_prices.get(symbol, sim_runner.current_config.initial_price)
+        current_ticks = price_to_ticks(current_price, tick_size)
         return sim_runner.portfolio.get_summary(
             current_price_ticks=current_ticks,
             tick_size=tick_size,
-            symbol=sim_runner.current_config.symbol,
+            symbol=symbol,
         )
 
     @app.post("/api/v1/portfolio/reset")
@@ -1448,11 +1488,13 @@ def create_app(
             initial_cash=effective_req.initial_cash,
             tick_size=tick_size,
         )
-        current_ticks = price_to_ticks(sim_runner._latest_price, tick_size)
+        primary_symbol = sim_runner.current_config.symbols[0]
+        current_price = sim_runner._latest_prices.get(primary_symbol, sim_runner.current_config.initial_price)
+        current_ticks = price_to_ticks(current_price, tick_size)
         summary = sim_runner.portfolio.get_summary(
             current_price_ticks=current_ticks,
             tick_size=tick_size,
-            symbol=sim_runner.current_config.symbol,
+            symbol=primary_symbol,
         )
         sim_runner.broadcaster.push_portfolio(summary)
         return {"status": "reset", "portfolio": summary}

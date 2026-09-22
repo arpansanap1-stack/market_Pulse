@@ -79,3 +79,45 @@ State is never the source of truth; **the event log is the sole source of truth*
 - **Matching Engine:** $\ge 5,000$ events/second per symbol in single-threaded pure Python.
 - **Streaming Throttling:** Raw engine events are coalesced at the edge broadcaster to 10–20 updates/second per channel to preserve browser responsiveness.
 - **Incremental Computations:** OHLC aggregation and streaming indicators execute in $\mathcal{O}(1)$ time per event/bar update.
+
+---
+
+## 4. Multi-Asset Simulation Engine (Phase 5)
+
+MarketPulse concurrently simulates multiple equity order books (`AAPL`, `MSFT`, `GOOGL`, `NVDA`) using priority-queue event multiplexing:
+- **`MultiplexedAgentSource`:** Spawns independent `AgentOrderSource` instances per symbol, each managing its own deterministic seed (`seed + i`), agent population, and `MatchingEngine`.
+- **Chronological Min-Heap:** A min-heap priority queue (`heapq`) keyed by `(ts_ns, tie_breaker, event, iterator)` interleaves events chronologically across all symbols without thread race conditions.
+- **State Partitioning:** The API server projects state into symbol-keyed maps (`aggregators[symbol]`, `anomaly_detectors[symbol]`, `depth_trackers[symbol]`, `advanced_orders[symbol]`, `_latest_prices[symbol]`).
+- **Interactive Watchlist:** The terminal renders a real-time multi-asset ribbon with live price updates and 1-click active symbol switching.
+
+---
+
+## 5. Order Management System (OMS) & Paper Portfolio (PMS) (Phase 6 & 8A)
+
+The OMS and PMS provide educational paper trading capabilities with institutional realism:
+- **Account Ledger:** `PortfolioTracker` maintains cash balances, position inventory (long and short), realized/unrealized P&L, and equity in integer ticks.
+- **Order Lifecycle:** Orders transition across `PENDING` $\to$ `OPEN` $\to$ `PARTIALLY_FILLED` $\to$ `FILLED` / `CANCELED` / `REJECTED`.
+- **Synthetic Trigger Engine:** `AdvancedOrderManager` manages off-book risk orders (`STOP_LOSS`, `STOP_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`, `TRAILING_STOP`) and `One-Cancels-the-Other` (OCO) bracket groups. Triggers are evaluated in $\mathcal{O}(1)$ time on each trade execution, ratcheting trailing stops with peak/trough watermarks.
+- **Atomic OCO Submission:** Multi-leg bracket submissions validate all legs atomically; validation failure on any leg rolls back the entire submission.
+
+---
+
+## 6. Self-Trade Prevention (STP) & Participant Attribution (Phase 7)
+
+MarketPulse prevents wash-trading and artificial volume inflation:
+- **Participant Attribution:** Every order and resting queue entry carries a `participant_id` (e.g., `mm_1`, `noise_2`, `user_trader`).
+- **STP Policies:** The matching engine enforces configurable self-crossing rules:
+  - `CANCEL_NEWEST`: Aggressor order is canceled with reason `STP_CANCEL_NEWEST`, preserving resting book depth.
+  - `CANCEL_OLDEST`: Conflicting resting order is canceled; aggressor continues matching.
+  - `DECREMENT_AND_CANCEL`: Overlapping quantity is decremented from both orders.
+- **Microstructure Telemetry:** STP statistics (`cancel_newest`, `cancel_oldest`, `decrement_and_cancel`, `total_prevented`) stream live to `/api/v1/market-status`.
+
+---
+
+## 7. Event Sourcing, Session Persistence & Historical Replay (Phase 5)
+
+All simulation sessions are persisted and replayable:
+- **Append-Only Store:** `SQLiteEventStore` records sequenced events with WAL mode, chunked prefetching, and structured metadata.
+- **Replay Engine:** `ReplayEventSource` replays historical sessions at variable speeds ($0.5\times$ to $10,000\times$, pause, seek) with pacing delay calculation.
+- **Full-Duplex Replay Streaming:** WebSockets stream historical session replays with live order book reconstruction and candle aggregation identical to real-time mode.
+

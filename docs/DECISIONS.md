@@ -242,13 +242,31 @@ This document records the key architectural and design decisions made throughout
   - Updated `PortfolioTracker`:
     - Added `OrderStatus.UNTRIGGERED` and `OrderStatus.TRIGGERED`.
     - Tracks `stop_price_ticks`, `trail_offset_ticks`, `oco_group_id`, `current_stop_ticks`.
-    - Displays working untriggered orders in open orders query.
-  - Integrated into API and `SimulationRunner`:
-    - Added atomic OCO endpoint `POST /api/v1/orders/oco` with rollback on partial validation failure.
-    - Routed untriggered orders to `AdvancedOrderManager`, with cancellations propagating to companion orders.
+---
+
+## ADR-018: Concurrent Multi-Asset Simulation and Priority-Queue Event Multiplexing
+
+- **Status:** Accepted
+- **Date:** 2026-09-22
+- **Context:**
+  - Real-world institutional electronic trading systems and market terminals (e.g. Bloomberg, Refinitiv, TradingView) monitor and trade across multiple assets and order books simultaneously.
+  - MarketPulse Phase 5 multi-symbol architecture requires concurrent simulated equity order books (AAPL, MSFT, GOOGL, NVDA) while maintaining strict chronological determinism, monotonic sequence ordering, and complete backward compatibility with single-symbol configurations.
+- **Decision:**
+  - Implemented `MultiplexedAgentSource` in `marketpulse.sim.multiplex_source`:
+    - Encapsulates multiple deterministic `AgentOrderSource` instances (one per simulated equity ticker) initialized with distinct deterministic seeds (`seed + i`).
+    - Uses a min-heap priority queue (`heapq`) keyed by `(event.ts_ns, tie_breaker, event, iterator)` to interleave market events chronologically across all symbols.
+    - Conforms to the pure `EventSource` protocol, guaranteeing monotonic nanosecond timestamps (`ts_ns`) across the entire multi-asset stream.
+  - Refactored `SimulationRunner` state in `marketpulse.api.server`:
+    - Converted single-symbol state projections into dictionary-keyed state collections: `aggregators: dict[str, OHLCAggregator]`, `anomaly_detectors: dict[str, StreamingAnomalyDetector]`, `advanced_orders: dict[str, AdvancedOrderManager]`, `depth_trackers: dict[str, ReplayDepthTracker]`, and `_latest_prices: dict[str, float]`.
+    - Enhanced `SessionConfigRequest` with dual support for `symbols: list[str]` (default `["AAPL", "MSFT", "GOOGL", "NVDA"]`) and legacy `symbol: str | None` via Pydantic `model_post_init`.
+    - Updated `/api/v1/symbols` to return full multi-symbol market catalog with live prices, tick sizes, and active statuses.
+    - Updated `/api/v1/book`, `/api/v1/bars`, `/api/v1/indicators`, and `/api/v1/market-status` with explicit `symbol` parameter routing.
+  - Enhanced Frontend Terminal Architecture:
+    - Created `Watchlist.tsx` real-time ribbon component displaying all simulated equities with real-time price updates, % change indicators, and active selection states.
+    - Integrated seamless 1-click active symbol switching in both `Watchlist.tsx` and `Header.tsx`, dynamically updating WebSocket subscriptions (`book`, `bars`, `anomalies`), L2 depth ladder, candlestick chart, order ticket, and trade tape.
 - **Alternatives Considered:**
-  - Embedding triggers inside `MatchingEngine`: Violates exchange microstructure separation of concerns, complicates price-time priority queues, and risks performance degradation in the inner continuous auction loop.
-  - Client-side polling / browser-triggered orders: Fragile, high latency, susceptible to browser disconnects, and non-deterministic across clients. Server-side OMS trigger management ensures deterministic evaluation and nanosecond-level responsiveness.
+  - Separate background OS threads or uncoordinated asyncio tasks per symbol: Introduces non-deterministic race conditions during event log append and historical replay. The min-heap priority queue maintains strict single-threaded determinism with byte-for-byte reproducibility across runs.
+
 
 
 

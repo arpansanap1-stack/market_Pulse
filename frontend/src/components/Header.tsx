@@ -8,6 +8,8 @@ interface HeaderProps {
   stats: MarketStats;
   currentTps: number;
   isHalted?: boolean;
+  availableSymbols?: string[];
+  onSelectSymbol?: (symbol: string) => void;
   onSetSimulationSpeed: (tps: number) => void;
   onResetSession: () => void;
 }
@@ -17,6 +19,8 @@ export const Header: React.FC<HeaderProps> = ({
   stats,
   currentTps,
   isHalted = false,
+  availableSymbols,
+  onSelectSymbol,
   onSetSimulationSpeed,
   onResetSession,
 }) => {
@@ -61,7 +65,21 @@ export const Header: React.FC<HeaderProps> = ({
         {/* Center: Live Ticker & Price Header */}
         <div className="flex items-center space-x-6">
           <div className="flex items-baseline space-x-3">
-            <span className="text-xl font-black tracking-wide text-white">{stats.symbol}</span>
+            {availableSymbols && availableSymbols.length > 1 && onSelectSymbol ? (
+              <select
+                value={stats.symbol}
+                onChange={(e) => onSelectSymbol(e.target.value)}
+                className="bg-slate-900 border border-slate-700/80 rounded px-2 py-0.5 text-lg font-black tracking-wide text-sky-400 focus:outline-none focus:border-sky-500 cursor-pointer"
+              >
+                {availableSymbols.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <span className="text-xl font-black tracking-wide text-white">{stats.symbol}</span>
+            )}
             <span className="text-xs text-slate-400">Simulated Equity</span>
             <span className={`font-tabular text-2xl font-bold ${isUp ? 'text-emerald-400' : 'text-rose-400'}`}>
               ${stats.lastPrice.toFixed(2)}

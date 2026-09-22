@@ -13,7 +13,7 @@ class SimulationConfig:
 
     session_id: str = "default_session"
     seed: int = 42
-    symbols: tuple[str, ...] = ("AAPL",)
+    symbols: tuple[str, ...] = ("AAPL", "MSFT", "GOOGL", "NVDA")
     tick_size: float = 0.01
     default_interval_ns: int = 1_000_000  # 1 millisecond
     throttling_fps: int = 20  # Broadcast throttling (updates/sec)
