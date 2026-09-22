@@ -51,6 +51,8 @@ class Broadcaster:
         self._pending_anomalies: dict[str, list[dict[str, Any]]] = defaultdict(list)
         # Buffered market events: channel -> list of event dicts
         self._pending_market_events: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        # Buffered portfolio updates: channel -> list of portfolio dicts
+        self._pending_portfolios: dict[str, list[dict[str, Any]]] = defaultdict(list)
         # Monotonic sequence counter per channel
         self._channel_seq: dict[str, int] = defaultdict(int)
 
@@ -123,6 +125,12 @@ class Broadcaster:
         self._pending_market_events["events:market"].append(event_dict)
         self._pending_market_events[f"events:{symbol}"].append(event_dict)
 
+    def push_portfolio(
+        self, portfolio_dict: dict[str, Any], channel: str = "portfolio:user"
+    ) -> None:
+        """Enqueue a portfolio summary update for dispatch on channel portfolio:user."""
+        self._pending_portfolios[channel].append(portfolio_dict)
+
     async def _run_flush_loop(self) -> None:
         """Periodic flush loop dispatching batched messages at throttling_fps."""
         while self._running:
@@ -140,6 +148,7 @@ class Broadcaster:
             and not self._pending_deltas
             and not self._pending_anomalies
             and not self._pending_market_events
+            and not self._pending_portfolios
         ):
             return
 
@@ -149,11 +158,13 @@ class Broadcaster:
             delta_batches = dict(self._pending_deltas)
             anomaly_batches = dict(self._pending_anomalies)
             market_event_batches = dict(self._pending_market_events)
+            portfolio_batches = dict(self._pending_portfolios)
             self._pending_trades.clear()
             self._pending_bars.clear()
             self._pending_deltas.clear()
             self._pending_anomalies.clear()
             self._pending_market_events.clear()
+            self._pending_portfolios.clear()
 
         epoch_ms = int(time.time() * 1000)
 
@@ -273,6 +284,30 @@ class Broadcaster:
                 "ts": epoch_ms,
                 "data": {
                     "market_events": events,
+                },
+            }
+            self._send_to_subscribers(subscribers, json.dumps(envelope))
+
+        # 6. Flush portfolio updates
+        for channel, summaries in portfolio_batches.items():
+            if not summaries:
+                continue
+
+            subscribers = self._channel_subscriptions.get(channel)
+            if not subscribers:
+                continue
+
+            self._channel_seq[channel] += 1
+            seq = self._channel_seq[channel]
+
+            envelope = {
+                "version": 1,
+                "type": "DATA",
+                "channel": channel,
+                "seq": seq,
+                "ts": epoch_ms,
+                "data": {
+                    "portfolio": summaries[-1],
                 },
             }
             self._send_to_subscribers(subscribers, json.dumps(envelope))

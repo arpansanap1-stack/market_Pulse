@@ -6,6 +6,7 @@ import type {
   Trade,
   WebSocketEnvelope,
 } from '../types/protocol';
+import type { PortfolioSummary } from '../types/portfolio';
 
 export type ConnectionStatus = 'CONNECTED' | 'CONNECTING' | 'DISCONNECTED';
 
@@ -15,6 +16,7 @@ type BarsBatchHandler = (interval: string, bars: Bar[]) => void;
 type BookBatchHandler = (deltas: BookDeltaItem[]) => void;
 type AnomaliesBatchHandler = (anomalies: MarketAnomaly[]) => void;
 type MarketEventsBatchHandler = (events: MarketEventPayload[]) => void;
+type PortfolioUpdateHandler = (portfolio: PortfolioSummary) => void;
 type StatusHandler = (status: ConnectionStatus) => void;
 
 export class MarketPulseWebSocketClient {
@@ -33,6 +35,7 @@ export class MarketPulseWebSocketClient {
   private onBookBatchCallbacks: Set<BookBatchHandler> = new Set();
   private onAnomaliesBatchCallbacks: Set<AnomaliesBatchHandler> = new Set();
   private onMarketEventsBatchCallbacks: Set<MarketEventsBatchHandler> = new Set();
+  private onPortfolioUpdateCallbacks: Set<PortfolioUpdateHandler> = new Set();
   private onStatusCallbacks: Set<StatusHandler> = new Set();
 
   constructor(url?: string) {
@@ -156,6 +159,11 @@ export class MarketPulseWebSocketClient {
     return () => this.onMarketEventsBatchCallbacks.delete(handler);
   }
 
+  public onPortfolioUpdate(handler: PortfolioUpdateHandler): () => void {
+    this.onPortfolioUpdateCallbacks.add(handler);
+    return () => this.onPortfolioUpdateCallbacks.delete(handler);
+  }
+
   public onStatusChange(handler: StatusHandler): () => void {
     this.onStatusCallbacks.add(handler);
     handler(this.status);
@@ -227,6 +235,18 @@ export class MarketPulseWebSocketClient {
       if (data?.market_events && Array.isArray(data.market_events) && data.market_events.length > 0) {
         for (const cb of this.onMarketEventsBatchCallbacks) {
           cb(data.market_events);
+        }
+      }
+    }
+
+    // Handle portfolio snapshots
+    if (envelope.type === 'DATA' && envelope.channel === 'portfolio:user') {
+      const data = envelope.data as { portfolio?: PortfolioSummary } | PortfolioSummary | undefined;
+      if (data) {
+        const summary =
+          'portfolio' in data && data.portfolio ? data.portfolio : (data as PortfolioSummary);
+        for (const cb of this.onPortfolioUpdateCallbacks) {
+          cb(summary);
         }
       }
     }

@@ -23,10 +23,17 @@ from marketpulse.core.events import (
     BookDelta,
     Event,
     MarketEvent,
+    OrderAccepted,
+    OrderCanceled,
+    OrderRejected,
+    OrderSubmitted,
+    OrderType,
     SessionEnded,
     SessionStarted,
     Side,
+    TimeInForce,
     TradeExecuted,
+    price_to_ticks,
     ticks_to_price,
 )
 from marketpulse.core.indicators import (
@@ -38,6 +45,10 @@ from marketpulse.core.indicators import (
     batch_vwap,
 )
 from marketpulse.core.ohlc import OHLCAggregator
+from marketpulse.core.portfolio import (
+    OrderStatus,
+    PortfolioTracker,
+)
 from marketpulse.core.scenarios import (
     create_earnings_shock,
     create_halt_event,
@@ -97,6 +108,23 @@ class SpeedRequest(BaseModel):
     """Request payload to update replay playback speed."""
 
     speed_multiplier: float = Field(gt=0, le=10000.0)
+
+
+class OrderSubmitRequest(BaseModel):
+    """Request payload to submit a manual user order."""
+
+    symbol: str = Field(default="AAPL")
+    side: Side = Field(default=Side.BUY)
+    order_type: OrderType = Field(default=OrderType.LIMIT)
+    price: float | None = Field(default=None, gt=0)
+    qty: int = Field(gt=0)
+    tif: TimeInForce = Field(default=TimeInForce.GTC)
+
+
+class PortfolioResetRequest(BaseModel):
+    """Request payload to reset portfolio balances."""
+
+    initial_cash: float = Field(default=100000.0, gt=0)
 
 
 class ReplayDepthTracker:
@@ -161,6 +189,7 @@ class SimulationRunner:
         self.replay_source: ReplayEventSource | None = None
         self.aggregator: OHLCAggregator = OHLCAggregator(symbol="AAPL")
         self.anomaly_detector: StreamingAnomalyDetector = StreamingAnomalyDetector(symbol="AAPL")
+        self.portfolio: PortfolioTracker = PortfolioTracker()
         self._sim_task: asyncio.Task[None] | None = None
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._running: bool = False
@@ -178,6 +207,7 @@ class SimulationRunner:
         self._replay_halted = False
         self.aggregator = OHLCAggregator(symbol=self.current_config.symbol)
         self.anomaly_detector = StreamingAnomalyDetector(symbol=self.current_config.symbol)
+        self.portfolio.reset(initial_cash=100_000.0, tick_size=self.current_config.tick_size)
         self._latest_price = self.current_config.initial_price
 
     def start(self, config: SessionConfigRequest) -> str:
@@ -195,6 +225,7 @@ class SimulationRunner:
             initial_price=config.initial_price,
             tick_size=config.tick_size,
         )
+        self.portfolio.reset(initial_cash=100_000.0, tick_size=config.tick_size)
 
         start_ts_ns = self.source._clock.now_ns()
         self.active_session_metadata = self.store.create_session(
@@ -396,6 +427,26 @@ class SimulationRunner:
             if broadcast:
                 self.broadcaster.push_trade(event.symbol, trade_dict)
 
+            # Portfolio execution fill updates
+            if event.buy_order_id in self.portfolio.orders:
+                self.portfolio.on_trade_executed(event, event.buy_order_id, Side.BUY)
+                if broadcast:
+                    summary = self.portfolio.get_summary(
+                        current_price_ticks=event.price_ticks,
+                        tick_size=self.current_config.tick_size,
+                        symbol=event.symbol,
+                    )
+                    self.broadcaster.push_portfolio(summary)
+            if event.sell_order_id in self.portfolio.orders:
+                self.portfolio.on_trade_executed(event, event.sell_order_id, Side.SELL)
+                if broadcast:
+                    summary = self.portfolio.get_summary(
+                        current_price_ticks=event.price_ticks,
+                        tick_size=self.current_config.tick_size,
+                        symbol=event.symbol,
+                    )
+                    self.broadcaster.push_portfolio(summary)
+
             # Streaming anomaly detection
             anomalies = self.anomaly_detector.on_trade(event)
             for anom in anomalies:
@@ -565,6 +616,112 @@ class SimulationRunner:
                     injected.append(r)
                     self.store.append_event(self.active_session_id, r)
         return injected
+
+    def submit_user_order(self, req: OrderSubmitRequest) -> dict[str, Any]:
+        """Validate, persist, and submit a user order to the matching engine."""
+        if self.mode != RunnerMode.LIVE or self.source is None:
+            raise RuntimeError("Live simulation is not running")
+
+        if self.source.engine.is_halted:
+            raise RuntimeError("Market is currently halted by circuit breaker")
+
+        tick_size = self.current_config.tick_size
+        if req.order_type == OrderType.LIMIT:
+            if req.price is None or req.price <= 0:
+                raise ValueError("Limit orders require a positive price")
+            price_ticks: int | None = price_to_ticks(req.price, tick_size)
+            est_ticks = price_ticks
+        else:
+            price_ticks = None
+            est_ticks = price_to_ticks(self._latest_price, tick_size)
+
+        valid, err = self.portfolio.validate_order(
+            symbol=req.symbol,
+            side=req.side,
+            order_type=req.order_type,
+            qty=req.qty,
+            price_ticks=price_ticks,
+            estimated_price_ticks=est_ticks,
+        )
+        if not valid:
+            raise ValueError(err or "Order validation failed")
+
+        order_id = f"usr_{uuid.uuid4().hex[:8]}"
+        seq = self.source.engine.allocate_seq()
+        ts_ns = self.source._clock.now_ns()
+
+        order_evt = OrderSubmitted(
+            seq=seq,
+            ts_ns=ts_ns,
+            symbol=req.symbol,
+            order_id=order_id,
+            side=req.side,
+            order_type=req.order_type,
+            price_ticks=price_ticks,
+            qty=req.qty,
+            tif=req.tif,
+        )
+
+        self.store.append_event(self.active_session_id, order_evt)
+        self._current_seq = seq
+        self._total_events = seq
+
+        self.portfolio.on_order_submitted(order_evt)
+
+        # Submit to matching engine
+        matching_events = self.source.engine.submit_order(order_evt)
+        for evt in matching_events:
+            self.store.append_event(self.active_session_id, evt)
+            self._current_seq = evt.seq
+            self._total_events = evt.seq
+            if isinstance(evt, OrderAccepted) and evt.order_id == order_id:
+                self.portfolio.on_order_accepted(evt)
+            elif isinstance(evt, OrderRejected) and evt.order_id == order_id:
+                self.portfolio.on_order_rejected(evt)
+            elif isinstance(evt, OrderCanceled) and evt.order_id == order_id:
+                self.portfolio.on_order_canceled(evt)
+            self._process_event(evt, broadcast=True)
+
+        current_ticks = price_to_ticks(self._latest_price, tick_size)
+        summary = self.portfolio.get_summary(current_ticks, tick_size, req.symbol)
+        self.broadcaster.push_portfolio(summary)
+
+        return self.portfolio.orders[order_id].to_dict(tick_size)
+
+    def cancel_user_order(self, order_id: str) -> dict[str, Any]:
+        """Cancel an active user order in the matching engine."""
+        if self.mode != RunnerMode.LIVE or self.source is None:
+            raise RuntimeError("Live simulation is not running")
+
+        if order_id not in self.portfolio.orders:
+            raise KeyError(f"Order '{order_id}' not found")
+
+        order = self.portfolio.orders[order_id]
+        if order.status not in (
+            OrderStatus.PENDING,
+            OrderStatus.OPEN,
+            OrderStatus.PARTIALLY_FILLED,
+        ):
+            raise ValueError(f"Cannot cancel order in status '{order.status.value}'")
+
+        ts_ns = self.source._clock.now_ns()
+        cancel_events = self.source.engine.cancel_order(
+            order_id, ts_ns=ts_ns, reason="USER_REQUESTED"
+        )
+        for evt in cancel_events:
+            self.store.append_event(self.active_session_id, evt)
+            self._current_seq = evt.seq
+            self._total_events = evt.seq
+            if isinstance(evt, OrderCanceled) and evt.order_id == order_id:
+                self.portfolio.on_order_canceled(evt)
+            self._process_event(evt, broadcast=True)
+
+        tick_size = self.current_config.tick_size
+        current_ticks = price_to_ticks(self._latest_price, tick_size)
+        summary = self.portfolio.get_summary(current_ticks, tick_size, order.symbol)
+        self.broadcaster.push_portfolio(summary)
+
+        return order.to_dict(tick_size)
 
     async def _auto_resume(self, delay_s: float, symbol: str) -> None:
         """Automatically resume trading after circuit breaker halt."""
@@ -989,6 +1146,77 @@ def create_app(
             "status": "HALTED" if is_halted else "ACTIVE",
             "latest_price": sim_runner._latest_price,
         }
+
+    # --- User Orders & Portfolio Management (OMS/PMS) Endpoints ---
+
+    @app.post("/api/v1/orders")
+    async def place_order(req: OrderSubmitRequest) -> dict[str, Any]:
+        """Submit a manual limit or market order to the matching engine."""
+        try:
+            return sim_runner.submit_user_order(req)
+        except KeyError as err:
+            raise HTTPException(status_code=404, detail=str(err)) from err
+        except (ValueError, RuntimeError) as err:
+            raise HTTPException(status_code=400, detail=str(err)) from err
+
+    @app.delete("/api/v1/orders/{order_id}")
+    async def cancel_order(order_id: str) -> dict[str, Any]:
+        """Cancel an open resting limit order."""
+        try:
+            return sim_runner.cancel_user_order(order_id)
+        except KeyError as err:
+            raise HTTPException(status_code=404, detail=str(err)) from err
+        except (ValueError, RuntimeError) as err:
+            raise HTTPException(status_code=400, detail=str(err)) from err
+
+    @app.get("/api/v1/orders")
+    async def get_orders(status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        """List active open orders or complete order history."""
+        if status == "open":
+            return sim_runner.portfolio.get_open_orders()
+        return sim_runner.portfolio.get_order_history(limit=limit)
+
+    @app.get("/api/v1/orders/{order_id}")
+    async def get_order(order_id: str) -> dict[str, Any]:
+        """Retrieve details of a single user order."""
+        order = sim_runner.portfolio.orders.get(order_id)
+        if order is None:
+            raise HTTPException(status_code=404, detail=f"Order '{order_id}' not found")
+        return order.to_dict(sim_runner.current_config.tick_size)
+
+    @app.get("/api/v1/portfolio")
+    async def get_portfolio() -> dict[str, Any]:
+        """Return paper trading account balance, equity, and position inventory."""
+        tick_size = sim_runner.current_config.tick_size
+        current_ticks = price_to_ticks(sim_runner._latest_price, tick_size)
+        return sim_runner.portfolio.get_summary(
+            current_price_ticks=current_ticks,
+            tick_size=tick_size,
+            symbol=sim_runner.current_config.symbol,
+        )
+
+    @app.post("/api/v1/portfolio/reset")
+    async def reset_portfolio(req: PortfolioResetRequest | None = None) -> dict[str, Any]:
+        """Reset paper trading balance and clear positions."""
+        effective_req = req or PortfolioResetRequest()
+        tick_size = sim_runner.current_config.tick_size
+        sim_runner.portfolio.reset(
+            initial_cash=effective_req.initial_cash,
+            tick_size=tick_size,
+        )
+        current_ticks = price_to_ticks(sim_runner._latest_price, tick_size)
+        summary = sim_runner.portfolio.get_summary(
+            current_price_ticks=current_ticks,
+            tick_size=tick_size,
+            symbol=sim_runner.current_config.symbol,
+        )
+        sim_runner.broadcaster.push_portfolio(summary)
+        return {"status": "reset", "portfolio": summary}
+
+    @app.get("/api/v1/portfolio/trades")
+    async def get_user_trades(limit: int = 50) -> list[dict[str, Any]]:
+        """Return user filled trade executions."""
+        return sim_runner.portfolio.get_trade_history(limit=limit)
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:

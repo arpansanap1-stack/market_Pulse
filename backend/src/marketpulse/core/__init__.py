@@ -58,6 +58,12 @@ from marketpulse.core.orderbook import (
     PriceLevel,
     RestingOrder,
 )
+from marketpulse.core.portfolio import (
+    OrderRecord,
+    OrderStatus,
+    PortfolioTracker,
+    Position,
+)
 from marketpulse.core.scenarios import (
     SCENARIO_CATALOG,
     ScenarioDefinition,
@@ -88,9 +94,13 @@ __all__ = [
     "OrderAccepted",
     "OrderBook",
     "OrderCanceled",
+    "OrderRecord",
     "OrderRejected",
+    "OrderStatus",
     "OrderSubmitted",
     "OrderType",
+    "PortfolioTracker",
+    "Position",
     "PriceLevel",
     "RestingOrder",
     "ScenarioDefinition",

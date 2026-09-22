@@ -193,13 +193,13 @@ def test_websocket_streaming_during_replay(test_app_client: TestClient) -> None:
         },
     )
     session_id = start_res.json()["session_id"]
-    time.sleep(0.3)
+    time.sleep(0.5)
     test_app_client.post(f"/api/v1/sessions/{session_id}/stop")
 
-    # 2. Start replay mode
+    # 2. Start replay mode at 10x speed
     test_app_client.post(
         f"/api/v1/sessions/{session_id}/replay",
-        json={"speed_multiplier": 1.0, "seek_seq": 1},
+        json={"speed_multiplier": 10.0, "seek_seq": 1},
     )
 
     # 3. Connect WebSocket and subscribe to order book deltas

@@ -177,6 +177,24 @@ This document records the key architectural and design decisions made throughout
   - Flat JSONL files: Poor random seek performance ($O(N)$ scanning required for sequence seek) and lacks ACID concurrency during high-throughput live simulation writes.
   - PostgreSQL / TimescaleDB: Violates Working Rule 4 (premature infrastructure). SQLite stdlib provides identical query capabilities with zero setup.
 
+## ADR-015: In-Memory Order Management System (OMS) and Portfolio Accounting (PMS)
+
+- **Status:** Accepted
+- **Date:** 2026-09-22
+- **Context:**
+  - Educational paper trading requires users to place LIMIT and MARKET orders (BUY/SELL, GTC/IOC/FOK) directly into the running matching engine alongside simulated trading agents.
+  - The portfolio system must maintain strict balance accounting without floating-point drift, tracking cash, positions, weighted average entry price, and realized/unrealized P&L in real time.
+- **Decision:**
+  - Implemented `PortfolioTracker` in `marketpulse.core.portfolio` as pure domain logic with zero external I/O or framework dependencies.
+  - All monetary values (cash, equity, prices, P&L) maintain internal precision using integer ticks, strictly preserving the accounting invariant: `Total Equity == Cash + Market Value == Initial Cash + Realized PnL + Unrealized PnL`.
+  - Integrated directly with `SimulationRunner` in `marketpulse.api.server` using user order IDs prefixed with `usr_`.
+  - User fills are detected synchronously during event dispatch via `_process_event` and pushed to subscribers on WebSocket channel `portfolio:user`.
+  - Exposed REST endpoints (`/api/v1/orders`, `/api/v1/portfolio`, `/api/v1/portfolio/reset`, `/api/v1/portfolio/trades`) for order submission, cancellation, listing, portfolio summaries, and balance resets.
+- **Alternatives Considered:**
+  - External broker simulation / SQLite table for orders: Unnecessary latency and persistence complexity for an interactive in-memory simulator; matching engine already persists all events (including `OrderSubmitted`, `OrderAccepted`, `TradeExecuted`, `OrderCanceled`) to the `SQLiteEventStore`.
+  - Float dollar accounting: Vulnerable to floating-point rounding accumulation errors across repeated partial fills. Integer ticks eliminate rounding discrepancies completely.
+
+
 
 
 

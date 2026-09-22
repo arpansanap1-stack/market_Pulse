@@ -3,6 +3,8 @@ import { AnomalyFeed } from './components/AnomalyFeed';
 import { DepthLadder } from './components/DepthLadder';
 import { Header } from './components/Header';
 import { MarketStatsCards } from './components/MarketStats';
+import { OrderTicket } from './components/OrderTicket';
+import { PortfolioPanel } from './components/PortfolioPanel';
 import { PriceChart } from './components/PriceChart';
 import type { PriceChartHandle } from './components/PriceChart';
 import { ReplayControls } from './components/ReplayControls';
@@ -19,6 +21,7 @@ import type {
   Trade,
 } from './types/protocol';
 import type { ActiveSessionStatus, SessionMetadata } from './types/session';
+import type { PortfolioSummary } from './types/portfolio';
 
 export const App: React.FC = () => {
   const [status, setStatus] = useState<ConnectionStatus>('CONNECTING');
@@ -28,9 +31,14 @@ export const App: React.FC = () => {
   const [bookDeltas, setBookDeltas] = useState<BookDeltaItem[]>([]);
   const [anomalies, setAnomalies] = useState<MarketAnomaly[]>([]);
   const [marketStatus, setMarketStatus] = useState<MarketStatus | null>(null);
-  const [rightPanelTab, setRightPanelTab] = useState<'ANOMALIES' | 'TAPE'>('ANOMALIES');
+  const [rightPanelTab, setRightPanelTab] = useState<'TICKET' | 'ANOMALIES' | 'TAPE'>('TICKET');
   const [sessionStatus, setSessionStatus] = useState<ActiveSessionStatus | null>(null);
   const [sessions, setSessions] = useState<SessionMetadata[]>([]);
+  const [portfolio, setPortfolio] = useState<PortfolioSummary | null>(null);
+  const [topOfBook, setTopOfBook] = useState<{ bestBid: number | null; bestAsk: number | null }>({
+    bestBid: null,
+    bestAsk: null,
+  });
 
   const [stats, setStats] = useState<MarketStats>({
     symbol: 'AAPL',
@@ -76,6 +84,34 @@ export const App: React.FC = () => {
     }
   };
 
+  const fetchPortfolio = async () => {
+    try {
+      const res = await fetch('http://localhost:8000/api/v1/portfolio');
+      if (res.ok) {
+        const data: PortfolioSummary = await res.json();
+        setPortfolio(data);
+      }
+    } catch {
+      // ignore network errors
+    }
+  };
+
+  const fetchTopOfBook = async () => {
+    try {
+      const res = await fetch('http://localhost:8000/api/v1/book?symbol=AAPL&levels=1');
+      if (res.ok) {
+        const data = await res.json();
+        const tickSize = 0.01;
+        setTopOfBook({
+          bestBid: data.best_bid ? Number((data.best_bid * tickSize).toFixed(2)) : null,
+          bestAsk: data.best_ask ? Number((data.best_ask * tickSize).toFixed(2)) : null,
+        });
+      }
+    } catch {
+      // ignore network errors
+    }
+  };
+
   // Fetch initial market status and session list
   useEffect(() => {
     fetch('http://localhost:8000/api/v1/market-status?symbol=AAPL')
@@ -87,9 +123,15 @@ export const App: React.FC = () => {
 
     fetchSessionStatus();
     fetchSessions();
+    fetchPortfolio();
+    fetchTopOfBook();
 
     const interval = setInterval(fetchSessionStatus, 800);
-    return () => clearInterval(interval);
+    const bookInterval = setInterval(fetchTopOfBook, 2000);
+    return () => {
+      clearInterval(interval);
+      clearInterval(bookInterval);
+    };
   }, []);
 
 
@@ -178,12 +220,17 @@ export const App: React.FC = () => {
       }
     });
 
+    const unsubscribePortfolio = client.onPortfolioUpdate((newPortfolio) => {
+      setPortfolio(newPortfolio);
+    });
+
     // Subscribe to symbol trades, order book, bar interval, anomalies, and events
     client.subscribe('trades:AAPL');
     client.subscribe('book:AAPL');
     client.subscribe(`bars:AAPL:${currentTimeframeRef.current}`);
     client.subscribe('anomalies:AAPL');
     client.subscribe('events:market');
+    client.subscribe('portfolio:user');
     client.connect();
 
     return () => {
@@ -193,6 +240,7 @@ export const App: React.FC = () => {
       unsubscribeBook();
       unsubscribeAnomalies();
       unsubscribeMarketEvents();
+      unsubscribePortfolio();
       client.disconnect();
       clientRef.current = null;
     };
@@ -394,7 +442,7 @@ export const App: React.FC = () => {
       />
 
       {/* Main Terminal Workspace Layout */}
-      <div className="flex-1 flex flex-col p-4 gap-3.5 overflow-hidden min-h-0">
+      <div className="flex-1 flex flex-col p-4 gap-3.5 overflow-y-auto min-h-0">
         {/* Top Metric Cards */}
         <MarketStatsCards stats={stats} />
 
@@ -417,9 +465,8 @@ export const App: React.FC = () => {
           onInject={handleInjectScenario}
         />
 
-
         {/* Center 12-Column Grid: Chart (6) + Order Book (3) + Tabbed Panel (3) */}
-        <div className="flex-1 grid grid-cols-12 gap-3.5 min-h-0">
+        <div className="grid grid-cols-12 gap-3.5 min-h-[500px]">
           {/* Main Chart Pane (6 Columns) */}
           <div className="col-span-12 lg:col-span-6 xl:col-span-6 h-full flex flex-col min-h-0">
             <PriceChart
@@ -434,19 +481,29 @@ export const App: React.FC = () => {
             <DepthLadder symbol={stats.symbol} deltas={bookDeltas} levels={10} />
           </div>
 
-          {/* Right Tabbed Panel: Microstructure Anomalies vs Trade Tape (3 Columns) */}
+          {/* Right Tabbed Panel: Order Ticket vs Microstructure Anomalies vs Trade Tape (3 Columns) */}
           <div className="col-span-12 sm:col-span-6 lg:col-span-3 xl:col-span-3 h-full flex flex-col min-h-0 bg-slate-900 border border-slate-800 rounded-lg overflow-hidden shadow-xl">
             {/* Panel Selector Tabs */}
             <div className="flex items-center border-b border-slate-800 bg-slate-950/70 p-1">
               <button
+                onClick={() => setRightPanelTab('TICKET')}
+                className={`flex-1 py-1.5 text-xs font-semibold rounded transition-colors flex items-center justify-center gap-1 ${
+                  rightPanelTab === 'TICKET'
+                    ? 'bg-slate-800 text-cyan-400 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <span>🎫 Trade</span>
+              </button>
+              <button
                 onClick={() => setRightPanelTab('ANOMALIES')}
-                className={`flex-1 py-1.5 text-xs font-semibold rounded transition-colors flex items-center justify-center gap-1.5 ${
+                className={`flex-1 py-1.5 text-xs font-semibold rounded transition-colors flex items-center justify-center gap-1 ${
                   rightPanelTab === 'ANOMALIES'
                     ? 'bg-slate-800 text-sky-400 shadow-sm'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                <span>⚡ Anomalies</span>
+                <span>⚡ Alert</span>
                 {anomalies.length > 0 && (
                   <span className="px-1.5 py-0.2 rounded-full text-[9px] font-mono bg-rose-500/20 text-rose-300">
                     {anomalies.length}
@@ -455,13 +512,13 @@ export const App: React.FC = () => {
               </button>
               <button
                 onClick={() => setRightPanelTab('TAPE')}
-                className={`flex-1 py-1.5 text-xs font-semibold rounded transition-colors flex items-center justify-center gap-1.5 ${
+                className={`flex-1 py-1.5 text-xs font-semibold rounded transition-colors flex items-center justify-center gap-1 ${
                   rightPanelTab === 'TAPE'
                     ? 'bg-slate-800 text-sky-400 shadow-sm'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                <span>📜 Trade Tape</span>
+                <span>📜 Tape</span>
                 <span className="px-1.5 py-0.2 rounded-full text-[9px] font-mono bg-slate-700 text-slate-300">
                   {recentTrades.length}
                 </span>
@@ -469,8 +526,21 @@ export const App: React.FC = () => {
             </div>
 
             {/* Tab Contents */}
-            <div className="flex-1 min-h-0 overflow-hidden">
-              {rightPanelTab === 'ANOMALIES' ? (
+            <div className="flex-1 min-h-0 overflow-y-auto">
+              {rightPanelTab === 'TICKET' ? (
+                <div className="p-2">
+                  <OrderTicket
+                    symbol={stats.symbol}
+                    bestBid={topOfBook.bestBid}
+                    bestAsk={topOfBook.bestAsk}
+                    lastPrice={stats.lastPrice}
+                    availableCash={portfolio?.cash ?? 100000.0}
+                    onOrderSubmitted={() => {
+                      fetchPortfolio();
+                    }}
+                  />
+                </div>
+              ) : rightPanelTab === 'ANOMALIES' ? (
                 <AnomalyFeed
                   anomalies={anomalies}
                   onClear={() => setAnomalies([])}
@@ -480,6 +550,14 @@ export const App: React.FC = () => {
               )}
             </div>
           </div>
+        </div>
+
+        {/* Portfolio & OMS Panel: Cash, Equity, Positions, Open Orders, and Trade History */}
+        <div className="shrink-0">
+          <PortfolioPanel
+            portfolio={portfolio}
+            onRefreshPortfolio={fetchPortfolio}
+          />
         </div>
       </div>
     </div>
