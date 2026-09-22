@@ -18,6 +18,7 @@ from marketpulse.core.events import (
     OrderSubmitted,
     OrderType,
     Side,
+    STPPolicy,
     TimeInForce,
 )
 
@@ -135,6 +136,8 @@ class MarketMakerAgent:
                     price_ticks=bid_price,
                     qty=qty,
                     tif=TimeInForce.GTC,
+                    participant_id=self.agent_id,
+                    stp=STPPolicy.CANCEL_NEWEST,
                 )
             )
             curr_seq += 1
@@ -157,6 +160,8 @@ class MarketMakerAgent:
                     price_ticks=ask_price,
                     qty=qty,
                     tif=TimeInForce.GTC,
+                    participant_id=self.agent_id,
+                    stp=STPPolicy.CANCEL_NEWEST,
                 )
             )
             curr_seq += 1
@@ -245,6 +250,8 @@ class NoiseTraderAgent:
                 price_ticks=None,
                 qty=qty,
                 tif=TimeInForce.IOC,
+                participant_id=self.agent_id,
+                stp=STPPolicy.CANCEL_NEWEST,
             )
         else:
             mid = ref_price_ticks
@@ -262,6 +269,8 @@ class NoiseTraderAgent:
                 price_ticks=limit_price,
                 qty=qty,
                 tif=TimeInForce.GTC,
+                participant_id=self.agent_id,
+                stp=STPPolicy.CANCEL_NEWEST,
             )
 
         return [order]
@@ -354,5 +363,7 @@ class TrendFollowerAgent:
                 price_ticks=price,
                 qty=qty,
                 tif=TimeInForce.GTC,
+                participant_id=self.agent_id,
+                stp=STPPolicy.CANCEL_NEWEST,
             )
         ]

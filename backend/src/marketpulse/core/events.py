@@ -43,6 +43,15 @@ class TimeInForce(StrEnum):
     FOK = "FOK"  # Fill Or Kill
 
 
+class STPPolicy(StrEnum):
+    """Self-trade prevention policies."""
+
+    CANCEL_NEWEST = "CANCEL_NEWEST"  # Incoming aggressor order is canceled (default)
+    CANCEL_OLDEST = "CANCEL_OLDEST"  # Resting passive order is canceled; aggressor continues
+    DECREMENT_AND_CANCEL = "DECREMENT_AND_CANCEL"  # Overlapping qty canceled from both
+    NONE = "NONE"  # Self-trades permitted (STP bypassed)
+
+
 class EventType(StrEnum):
     """Canonical event types recognized across the MarketPulse platform."""
 
@@ -140,6 +149,8 @@ class OrderSubmitted(Event):
     price_ticks: int | None
     qty: int
     tif: TimeInForce = TimeInForce.GTC
+    participant_id: str = ""
+    stp: STPPolicy = STPPolicy.CANCEL_NEWEST
 
     def __post_init__(self) -> None:
         Event._validate_base(self)
@@ -216,6 +227,8 @@ class TradeExecuted(Event):
     aggressor_side: Side
     buy_order_id: str
     sell_order_id: str
+    buyer_participant_id: str = ""
+    seller_participant_id: str = ""
 
     def __post_init__(self) -> None:
         Event._validate_base(self)
@@ -312,6 +325,8 @@ def event_from_dict(data: Mapping[str, Any]) -> Event:
         kwargs["order_type"] = OrderType(kwargs["order_type"])
     if "tif" in kwargs and isinstance(kwargs["tif"], str):
         kwargs["tif"] = TimeInForce(kwargs["tif"])
+    if "stp" in kwargs and isinstance(kwargs["stp"], str):
+        kwargs["stp"] = STPPolicy(kwargs["stp"])
     if "symbols" in kwargs and isinstance(kwargs["symbols"], list):
         kwargs["symbols"] = tuple(kwargs["symbols"])
 

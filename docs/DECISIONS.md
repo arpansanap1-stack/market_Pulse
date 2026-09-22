@@ -45,6 +45,7 @@ This document records the key architectural and design decisions made throughout
 
 ## ADR-005: Self-Trade Handling Policy
 
+- **Status:** Implemented in Phase 7 (see ADR-016)
 - **Context:** In continuous double-auction markets, an incoming order may cross a resting order belonging to the same participant or account (self-trade).
 - **Decision:** For the initial simulation, self-trades are permitted by default when orders originate from anonymous or distinct simulated agents. When participant IDs are introduced in Phase 7, the matching engine defaults to **Cancel-Newest** (the incoming aggressor order is cancelled to protect resting liquidity).
 - **Alternatives Considered:**
@@ -193,6 +194,31 @@ This document records the key architectural and design decisions made throughout
 - **Alternatives Considered:**
   - External broker simulation / SQLite table for orders: Unnecessary latency and persistence complexity for an interactive in-memory simulator; matching engine already persists all events (including `OrderSubmitted`, `OrderAccepted`, `TradeExecuted`, `OrderCanceled`) to the `SQLiteEventStore`.
   - Float dollar accounting: Vulnerable to floating-point rounding accumulation errors across repeated partial fills. Integer ticks eliminate rounding discrepancies completely.
+
+---
+
+## ADR-016: Participant IDs, Self-Trade Prevention (STP), and Wash-Trade Protection
+
+- **Status:** Accepted
+- **Date:** 2026-09-22
+- **Context:**
+  - Real-world financial exchanges (e.g., NASDAQ, CME, LSE) enforce Self-Trade Prevention (STP) mechanisms to protect market participants from unintended self-crossing, artificial volume inflation, and wash trading.
+  - In MarketPulse Phase 7, simulated algorithmic agents (`mm_1`, `noise_1`, `trend_1`) and manual user orders (`usr_...` / `user_trader`) interact in the same limit order book. Without attribution and wash-trade protection, market makers might fill their own quotes and user orders can accidentally self-cross.
+- **Decision:**
+  - Implemented `STPPolicy` enum (`CANCEL_NEWEST`, `CANCEL_OLDEST`, `DECREMENT_AND_CANCEL`, `NONE`) in `marketpulse.core.events`.
+  - Added `participant_id: str` and `stp: STPPolicy` to `OrderSubmitted`, `RestingOrder`, and `OrderRecord`.
+  - Added `buyer_participant_id: str` and `seller_participant_id: str` to `TradeExecuted`.
+  - Configured matching engine in `marketpulse.core.orderbook.MatchingEngine`:
+    - Checks `order.participant_id and front_order.participant_id and order.participant_id == front_order.participant_id and stp_policy != STPPolicy.NONE`.
+    - If `CANCEL_NEWEST`: Aggressor is canceled with `OrderCanceled(reason="STP_CANCEL_NEWEST")`, protecting resting book liquidity.
+    - If `CANCEL_OLDEST`: Resting order is removed and canceled with `OrderCanceled(reason="STP_CANCEL_OLDEST")`, allowing the aggressor to continue matching or rest.
+    - If `DECREMENT_AND_CANCEL`: Both orders are decremented by the overlapping quantity; the exhausted order is canceled.
+  - Maintained full backward compatibility: empty or omitted `participant_id` bypasses STP checks.
+  - Exposed STP metrics (`cancel_newest`, `cancel_oldest`, `decrement_and_cancel`, `total_prevented`) in `MatchingEngine.get_stp_stats()` and `/api/v1/market-status`.
+  - Updated UI: `OrderTicket` provides an interactive STP policy selector; `TradeTape` renders color-coded participant badges (`YOU`, `MM`, `NOISE`, `MOMENTUM`).
+- **Alternatives Considered:**
+  - Hard error / Order Rejection at submission: Infeasible because whether an order will cross a self-resting order depends on market state and book price levels at matching time.
+  - Post-trade wash trade detection only: Still creates dirty market data, erroneous price prints, and commission/cash balance deductions. Real-time pre-match STP prevents execution entirely.
 
 
 

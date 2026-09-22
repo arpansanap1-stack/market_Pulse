@@ -2,7 +2,9 @@
  * Portfolio Management and Order Management System (OMS/PMS) Types.
  */
 
-import type { Side } from './protocol';
+import type { Side, STPPolicy } from './protocol';
+
+export type { STPPolicy };
 
 export type OrderStatus =
   | 'PENDING'
@@ -30,7 +32,12 @@ export interface OrderRecord {
   tif: TimeInForce;
   created_ts_ns: number;
   updated_ts_ns: number;
+  avg_fill_price?: number | null;
+  avg_fill_price_ticks?: number | null;
+  reject_reason?: string | null;
   rejection_reason?: string | null;
+  participant_id?: string;
+  stp?: STPPolicy;
 }
 
 export interface PositionItem {
@@ -84,4 +91,6 @@ export interface OrderSubmitPayload {
   price?: number | null;
   qty: number;
   tif?: TimeInForce;
+  participant_id?: string;
+  stp?: STPPolicy;
 }

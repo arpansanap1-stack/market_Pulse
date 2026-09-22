@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Send, AlertCircle, CheckCircle2, RefreshCw } from 'lucide-react';
-import type { Side } from '../types/protocol';
-import type { OrderRecord, OrderType, TimeInForce } from '../types/portfolio';
+import type { Side, STPPolicy } from '../types/protocol';
+import type { OrderRecord, OrderType, TimeInForce, OrderSubmitPayload } from '../types/portfolio';
 
 interface OrderTicketProps {
   symbol: string;
@@ -27,6 +27,8 @@ export const OrderTicket: React.FC<OrderTicketProps> = ({
   );
   const [qtyStr, setQtyStr] = useState<string>('10');
   const [tif, setTif] = useState<TimeInForce>('GTC');
+  const [stp, setStp] = useState<STPPolicy>('CANCEL_NEWEST');
+  const [participantId] = useState<string>('user_trader');
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [feedback, setFeedback] = useState<{
     type: 'success' | 'error';
@@ -92,13 +94,15 @@ export const OrderTicket: React.FC<OrderTicketProps> = ({
 
     setSubmitting(true);
     try {
-      const payload = {
+      const payload: OrderSubmitPayload = {
         symbol,
         side,
         order_type: orderType,
         price: orderType === 'LIMIT' ? parsedPrice : null,
         qty: parsedQty,
         tif,
+        participant_id: participantId,
+        stp,
       };
 
       const res = await fetch('http://localhost:8000/api/v1/orders', {
@@ -113,10 +117,17 @@ export const OrderTicket: React.FC<OrderTicketProps> = ({
       }
 
       const orderResult: OrderRecord = await res.json();
-      setFeedback({
-        type: 'success',
-        message: `${side} ${parsedQty} ${symbol} submitted [${orderResult.status}]`,
-      });
+      if (orderResult.status === 'CANCELED' && orderResult.reject_reason?.startsWith('STP_')) {
+        setFeedback({
+          type: 'error',
+          message: `Self-Trade Prevented: ${orderResult.reject_reason}`,
+        });
+      } else {
+        setFeedback({
+          type: 'success',
+          message: `${side} ${parsedQty} ${symbol} submitted [${orderResult.status}]`,
+        });
+      }
 
       if (onOrderSubmitted) {
         onOrderSubmitted(orderResult);
@@ -348,6 +359,43 @@ export const OrderTicket: React.FC<OrderTicketProps> = ({
                 }`}
               >
                 {t}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Self-Trade Prevention (STP) Policy */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-1">
+            <span className="text-[11px] font-mono text-slate-400 uppercase">STP</span>
+            <span
+              className="text-[9px] text-slate-500 font-mono hidden sm:inline"
+              title="Self-Trade Prevention policy: protects against unintended wash trading"
+            >
+              (Wash Guard)
+            </span>
+          </div>
+          <div className="flex bg-slate-950 rounded border border-slate-800 p-0.5 text-[10px] font-mono">
+            {(
+              [
+                { id: 'CANCEL_NEWEST', label: 'CN', title: 'Cancel Newest: cancels incoming order to protect resting book' },
+                { id: 'CANCEL_OLDEST', label: 'CO', title: 'Cancel Oldest: cancels resting order and lets aggressor match/rest' },
+                { id: 'DECREMENT_AND_CANCEL', label: 'DC', title: 'Decrement & Cancel: offsets overlapping volume' },
+                { id: 'NONE', label: 'None', title: 'None: self-trades permitted (wash trading allowed)' },
+              ] as const
+            ).map((opt) => (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => setStp(opt.id)}
+                title={opt.title}
+                className={`px-1.5 py-0.5 rounded transition-colors ${
+                  stp === opt.id
+                    ? 'bg-slate-800 text-amber-400 font-semibold'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {opt.label}
               </button>
             ))}
           </div>

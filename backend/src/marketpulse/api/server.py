@@ -31,6 +31,7 @@ from marketpulse.core.events import (
     SessionEnded,
     SessionStarted,
     Side,
+    STPPolicy,
     TimeInForce,
     TradeExecuted,
     price_to_ticks,
@@ -119,6 +120,8 @@ class OrderSubmitRequest(BaseModel):
     price: float | None = Field(default=None, gt=0)
     qty: int = Field(gt=0)
     tif: TimeInForce = Field(default=TimeInForce.GTC)
+    participant_id: str = Field(default="user_trader")
+    stp: STPPolicy = Field(default=STPPolicy.CANCEL_NEWEST)
 
 
 class PortfolioResetRequest(BaseModel):
@@ -422,6 +425,8 @@ class SimulationRunner:
                 "price": price,
                 "qty": event.qty,
                 "aggressor_side": event.aggressor_side.value,
+                "buyer_participant_id": event.buyer_participant_id,
+                "seller_participant_id": event.seller_participant_id,
             }
             self.recent_trades.append(trade_dict)
             if broadcast:
@@ -660,6 +665,8 @@ class SimulationRunner:
             price_ticks=price_ticks,
             qty=req.qty,
             tif=req.tif,
+            participant_id=req.participant_id,
+            stp=req.stp,
         )
 
         self.store.append_event(self.active_session_id, order_evt)
@@ -674,11 +681,11 @@ class SimulationRunner:
             self.store.append_event(self.active_session_id, evt)
             self._current_seq = evt.seq
             self._total_events = evt.seq
-            if isinstance(evt, OrderAccepted) and evt.order_id == order_id:
+            if isinstance(evt, OrderAccepted) and evt.order_id in self.portfolio.orders:
                 self.portfolio.on_order_accepted(evt)
-            elif isinstance(evt, OrderRejected) and evt.order_id == order_id:
+            elif isinstance(evt, OrderRejected) and evt.order_id in self.portfolio.orders:
                 self.portfolio.on_order_rejected(evt)
-            elif isinstance(evt, OrderCanceled) and evt.order_id == order_id:
+            elif isinstance(evt, OrderCanceled) and evt.order_id in self.portfolio.orders:
                 self.portfolio.on_order_canceled(evt)
             self._process_event(evt, broadcast=True)
 
@@ -1134,17 +1141,29 @@ def create_app(
 
     @app.get("/api/v1/market-status")
     async def get_market_status(symbol: str = "AAPL") -> dict[str, Any]:
-        """Return market state including circuit breaker halt status."""
+        """Return market state including circuit breaker halt status and STP metrics."""
         if sim_runner.mode == RunnerMode.REPLAY:
             is_halted = sim_runner._replay_halted
         else:
             is_halted = sim_runner.source.engine.is_halted if sim_runner.source else False
+
+        stp_stats = (
+            sim_runner.source.engine.get_stp_stats()
+            if (sim_runner.source and sim_runner.mode == RunnerMode.LIVE)
+            else {
+                "cancel_newest": 0,
+                "cancel_oldest": 0,
+                "decrement_and_cancel": 0,
+                "total_prevented": 0,
+            }
+        )
 
         return {
             "symbol": symbol,
             "is_halted": is_halted,
             "status": "HALTED" if is_halted else "ACTIVE",
             "latest_price": sim_runner._latest_price,
+            "stp_stats": stp_stats,
         }
 
     # --- User Orders & Portfolio Management (OMS/PMS) Endpoints ---

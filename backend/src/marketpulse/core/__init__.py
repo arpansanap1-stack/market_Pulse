@@ -23,6 +23,7 @@ from marketpulse.core.events import (
     SessionEnded,
     SessionStarted,
     Side,
+    STPPolicy,
     TimeInForce,
     TradeExecuted,
 )
@@ -103,6 +104,7 @@ __all__ = [
     "Position",
     "PriceLevel",
     "RestingOrder",
+    "STPPolicy",
     "ScenarioDefinition",
     "SessionEnded",
     "SessionStarted",

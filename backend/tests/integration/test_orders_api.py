@@ -220,3 +220,113 @@ def test_portfolio_reset(client: TestClient) -> None:
     # Verify trades list is cleared
     trades_res = client.get("/api/v1/portfolio/trades")
     assert trades_res.json() == []
+
+
+def test_order_stp_cancel_newest_via_api(client: TestClient) -> None:
+    """Verify STP CANCEL_NEWEST cancels the incoming user order when matching self."""
+    # 1. Fetch current book to find empty inside spread (mid price)
+    book_res = client.get("/api/v1/book?symbol=AAPL")
+    assert book_res.status_code == 200
+    mid = book_res.json()["mid_price"]
+
+    # 2. Place a resting LIMIT SELL at mid inside spread
+    sell_res = client.post(
+        "/api/v1/orders",
+        json={
+            "symbol": "AAPL",
+            "side": "SELL",
+            "order_type": "LIMIT",
+            "price": mid,
+            "qty": 10,
+            "participant_id": "desk_alpha",
+            "stp": "CANCEL_NEWEST",
+        },
+    )
+    assert sell_res.status_code == 200
+    sell_order = sell_res.json()
+    assert sell_order["status"] == "OPEN"
+    assert sell_order["participant_id"] == "desk_alpha"
+
+    # 3. Place an aggressive LIMIT BUY at mid from the same participant
+    buy_res = client.post(
+        "/api/v1/orders",
+        json={
+            "symbol": "AAPL",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "price": mid,
+            "qty": 10,
+            "participant_id": "desk_alpha",
+            "stp": "CANCEL_NEWEST",
+        },
+    )
+    assert buy_res.status_code == 200
+    buy_order = buy_res.json()
+    assert buy_order["status"] == "CANCELED"
+    assert buy_order["reject_reason"] == "STP_CANCEL_NEWEST"
+
+    # 4. Verify the resting sell order is still OPEN
+    s_check = client.get(f"/api/v1/orders/{sell_order['order_id']}")
+    assert s_check.status_code == 200
+    assert s_check.json()["status"] == "OPEN"
+
+    # 5. Check market-status telemetry
+    status_res = client.get("/api/v1/market-status")
+    assert status_res.status_code == 200
+    stp_stats = status_res.json()["stp_stats"]
+    assert stp_stats["cancel_newest"] >= 1
+    assert stp_stats["total_prevented"] >= 1
+
+
+def test_order_stp_cancel_oldest_via_api(client: TestClient) -> None:
+    """Verify STP CANCEL_OLDEST cancels the resting order when matched by self."""
+    # 1. Fetch current book to find empty inside spread (mid price)
+    book_res = client.get("/api/v1/book?symbol=AAPL")
+    assert book_res.status_code == 200
+    mid = book_res.json()["mid_price"]
+
+    # 2. Place resting LIMIT SELL at mid inside spread
+    sell_res = client.post(
+        "/api/v1/orders",
+        json={
+            "symbol": "AAPL",
+            "side": "SELL",
+            "order_type": "LIMIT",
+            "price": mid,
+            "qty": 10,
+            "participant_id": "desk_beta",
+            "stp": "CANCEL_OLDEST",
+        },
+    )
+    assert sell_res.status_code == 200
+    sell_order = sell_res.json()
+    assert sell_order["status"] == "OPEN"
+
+    # 3. Aggressive LIMIT BUY at mid with CANCEL_OLDEST
+    buy_res = client.post(
+        "/api/v1/orders",
+        json={
+            "symbol": "AAPL",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "price": mid,
+            "qty": 10,
+            "participant_id": "desk_beta",
+            "stp": "CANCEL_OLDEST",
+        },
+    )
+    assert buy_res.status_code == 200
+    buy_order = buy_res.json()
+    assert buy_order["status"] == "OPEN"
+
+    # 4. Resting sell order should now be CANCELED
+    s_check = client.get(f"/api/v1/orders/{sell_order['order_id']}")
+    assert s_check.status_code == 200
+    assert s_check.json()["status"] == "CANCELED"
+    assert s_check.json()["reject_reason"] == "STP_CANCEL_OLDEST"
+
+    # 5. Check market-status telemetry
+    status_res = client.get("/api/v1/market-status")
+    assert status_res.status_code == 200
+    stp_stats = status_res.json()["stp_stats"]
+    assert stp_stats["cancel_oldest"] >= 1

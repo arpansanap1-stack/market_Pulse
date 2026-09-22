@@ -16,6 +16,7 @@ from marketpulse.core.events import (
     OrderSubmitted,
     OrderType,
     Side,
+    STPPolicy,
     TimeInForce,
     TradeExecuted,
 )
@@ -545,3 +546,288 @@ def test_matching_engine_performance() -> None:
     rate = len(orders) / elapsed
     # Assert at least 5,000 orders/sec
     assert rate >= 5000, f"Rate {rate:.1f} orders/sec was below 5,000 target"
+
+
+def test_stp_cancel_newest() -> None:
+    """STP CANCEL_NEWEST cancels aggressor order when attempting to match own resting order."""
+    engine = MatchingEngine("AAPL")
+
+    # Resting sell order from participant "trader_a"
+    engine.submit_order(
+        OrderSubmitted(
+            seq=1,
+            ts_ns=100,
+            symbol="AAPL",
+            order_id="s1",
+            side=Side.SELL,
+            order_type=OrderType.LIMIT,
+            price_ticks=15000,
+            qty=100,
+            participant_id="trader_a",
+        )
+    )
+
+    # Aggressor buy order from participant "trader_a" with CANCEL_NEWEST
+    events = engine.submit_order(
+        OrderSubmitted(
+            seq=2,
+            ts_ns=200,
+            symbol="AAPL",
+            order_id="b1",
+            side=Side.BUY,
+            order_type=OrderType.LIMIT,
+            price_ticks=15000,
+            qty=100,
+            participant_id="trader_a",
+            stp=STPPolicy.CANCEL_NEWEST,
+        )
+    )
+
+    trades = [e for e in events if isinstance(e, TradeExecuted)]
+    cancels = [e for e in events if isinstance(e, OrderCanceled)]
+    assert len(trades) == 0
+    assert len(cancels) == 1
+    assert cancels[0].order_id == "b1"
+    assert cancels[0].reason == "STP_CANCEL_NEWEST"
+
+    # Resting sell order remains untouched
+    assert engine.book.best_ask() == 15000
+    resting_s1 = engine.book.get_order("s1")
+    assert resting_s1 is not None
+    assert resting_s1.remaining_qty == 100
+
+    stats = engine.get_stp_stats()
+    assert stats["cancel_newest"] == 1
+    assert stats["total_prevented"] == 1
+
+
+def test_stp_cancel_oldest() -> None:
+    """STP CANCEL_OLDEST cancels resting order and allows aggressor to match or rest."""
+    engine = MatchingEngine("AAPL")
+
+    # Resting sell order from "trader_a"
+    engine.submit_order(
+        OrderSubmitted(
+            seq=1,
+            ts_ns=100,
+            symbol="AAPL",
+            order_id="s1",
+            side=Side.SELL,
+            order_type=OrderType.LIMIT,
+            price_ticks=15000,
+            qty=100,
+            participant_id="trader_a",
+        )
+    )
+
+    # Aggressor buy order from "trader_a" with CANCEL_OLDEST
+    events = engine.submit_order(
+        OrderSubmitted(
+            seq=2,
+            ts_ns=200,
+            symbol="AAPL",
+            order_id="b1",
+            side=Side.BUY,
+            order_type=OrderType.LIMIT,
+            price_ticks=15000,
+            qty=50,
+            participant_id="trader_a",
+            stp=STPPolicy.CANCEL_OLDEST,
+        )
+    )
+
+    trades = [e for e in events if isinstance(e, TradeExecuted)]
+    cancels = [e for e in events if isinstance(e, OrderCanceled)]
+    assert len(trades) == 0
+    assert len(cancels) == 1
+    assert cancels[0].order_id == "s1"
+    assert cancels[0].reason == "STP_CANCEL_OLDEST"
+
+    # s1 is gone, b1 rests at 15000
+    assert engine.book.get_order("s1") is None
+    assert engine.book.best_ask() is None
+    assert engine.book.best_bid() == 15000
+    assert engine.book.get_order("b1") is not None
+
+    stats = engine.get_stp_stats()
+    assert stats["cancel_oldest"] == 1
+    assert stats["total_prevented"] == 1
+
+
+def test_stp_decrement_and_cancel() -> None:
+    """STP DECREMENT_AND_CANCEL decrements both orders by the overlap quantity."""
+    engine = MatchingEngine("AAPL")
+
+    # Resting sell order of 100 shares
+    engine.submit_order(
+        OrderSubmitted(
+            seq=1,
+            ts_ns=100,
+            symbol="AAPL",
+            order_id="s1",
+            side=Side.SELL,
+            order_type=OrderType.LIMIT,
+            price_ticks=15000,
+            qty=100,
+            participant_id="trader_a",
+        )
+    )
+
+    # Aggressor buy order of 40 shares: overlap = 40.
+    # Aggressor b1 is exhausted and canceled. Resting s1 is reduced from 100 to 60.
+    events = engine.submit_order(
+        OrderSubmitted(
+            seq=2,
+            ts_ns=200,
+            symbol="AAPL",
+            order_id="b1",
+            side=Side.BUY,
+            order_type=OrderType.LIMIT,
+            price_ticks=15000,
+            qty=40,
+            participant_id="trader_a",
+            stp=STPPolicy.DECREMENT_AND_CANCEL,
+        )
+    )
+
+    trades = [e for e in events if isinstance(e, TradeExecuted)]
+    cancels = [e for e in events if isinstance(e, OrderCanceled)]
+    assert len(trades) == 0
+    assert len(cancels) == 1
+    assert cancels[0].order_id == "b1"
+    assert cancels[0].reason == "STP_DECREMENT_AND_CANCEL"
+
+    s1 = engine.book.get_order("s1")
+    assert s1 is not None
+    assert s1.remaining_qty == 60
+
+    # Next aggressor buy order of 80 shares: overlap = 60.
+    # Resting s1 is exhausted and canceled. Aggressor b2 remaining 20 rests on book.
+    events2 = engine.submit_order(
+        OrderSubmitted(
+            seq=3,
+            ts_ns=300,
+            symbol="AAPL",
+            order_id="b2",
+            side=Side.BUY,
+            order_type=OrderType.LIMIT,
+            price_ticks=15000,
+            qty=80,
+            participant_id="trader_a",
+            stp=STPPolicy.DECREMENT_AND_CANCEL,
+        )
+    )
+
+    cancels2 = [e for e in events2 if isinstance(e, OrderCanceled)]
+    assert len(cancels2) == 1
+    assert cancels2[0].order_id == "s1"
+    assert cancels2[0].reason == "STP_DECREMENT_AND_CANCEL"
+    assert engine.book.get_order("s1") is None
+
+    b2 = engine.book.get_order("b2")
+    assert b2 is not None
+    assert b2.remaining_qty == 20
+    assert engine.book.best_bid() == 15000
+
+    stats = engine.get_stp_stats()
+    assert stats["decrement_and_cancel"] == 2
+
+
+def test_stp_none_policy_executes_trade() -> None:
+    """STP NONE allows self-matching and attributes participant IDs to the trade."""
+    engine = MatchingEngine("AAPL")
+
+    engine.submit_order(
+        OrderSubmitted(
+            seq=1,
+            ts_ns=100,
+            symbol="AAPL",
+            order_id="s1",
+            side=Side.SELL,
+            order_type=OrderType.LIMIT,
+            price_ticks=15000,
+            qty=50,
+            participant_id="trader_a",
+        )
+    )
+
+    events = engine.submit_order(
+        OrderSubmitted(
+            seq=2,
+            ts_ns=200,
+            symbol="AAPL",
+            order_id="b1",
+            side=Side.BUY,
+            order_type=OrderType.LIMIT,
+            price_ticks=15000,
+            qty=50,
+            participant_id="trader_a",
+            stp=STPPolicy.NONE,
+        )
+    )
+
+    trades = [e for e in events if isinstance(e, TradeExecuted)]
+    assert len(trades) == 1
+    assert trades[0].buyer_participant_id == "trader_a"
+    assert trades[0].seller_participant_id == "trader_a"
+    assert engine.get_stp_stats()["total_prevented"] == 0
+
+
+def test_stp_different_participants_match() -> None:
+    """Orders with different or empty participant IDs match normally."""
+    engine = MatchingEngine("AAPL")
+
+    engine.submit_order(
+        OrderSubmitted(
+            seq=1,
+            ts_ns=100,
+            symbol="AAPL",
+            order_id="s1",
+            side=Side.SELL,
+            order_type=OrderType.LIMIT,
+            price_ticks=15000,
+            qty=100,
+            participant_id="trader_a",
+        )
+    )
+
+    # trader_b buy 40
+    events = engine.submit_order(
+        OrderSubmitted(
+            seq=2,
+            ts_ns=200,
+            symbol="AAPL",
+            order_id="b1",
+            side=Side.BUY,
+            order_type=OrderType.LIMIT,
+            price_ticks=15000,
+            qty=40,
+            participant_id="trader_b",
+            stp=STPPolicy.CANCEL_NEWEST,
+        )
+    )
+    trades = [e for e in events if isinstance(e, TradeExecuted)]
+    assert len(trades) == 1
+    assert trades[0].buyer_participant_id == "trader_b"
+    assert trades[0].seller_participant_id == "trader_a"
+
+    # anonymous buy 30
+    events2 = engine.submit_order(
+        OrderSubmitted(
+            seq=3,
+            ts_ns=300,
+            symbol="AAPL",
+            order_id="b2",
+            side=Side.BUY,
+            order_type=OrderType.LIMIT,
+            price_ticks=15000,
+            qty=30,
+            participant_id="",
+            stp=STPPolicy.CANCEL_NEWEST,
+        )
+    )
+    trades2 = [e for e in events2 if isinstance(e, TradeExecuted)]
+    assert len(trades2) == 1
+    assert trades2[0].buyer_participant_id == ""
+    assert trades2[0].seller_participant_id == "trader_a"
+    assert engine.get_stp_stats()["total_prevented"] == 0

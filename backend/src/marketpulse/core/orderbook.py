@@ -27,6 +27,7 @@ from marketpulse.core.events import (
     OrderSubmitted,
     OrderType,
     Side,
+    STPPolicy,
     TimeInForce,
     TradeExecuted,
 )
@@ -44,6 +45,7 @@ class RestingOrder:
     ts_ns: int
     seq: int
     tif: TimeInForce = TimeInForce.GTC
+    participant_id: str = ""
 
 
 class PriceLevel:
@@ -312,9 +314,24 @@ class MatchingEngine:
     - Passive resting orders dictate the execution price.
     """
 
-    __slots__ = ("_book", "_seq", "_trade_count", "is_halted", "symbol")
+    __slots__ = (
+        "_book",
+        "_seq",
+        "_trade_count",
+        "default_stp_policy",
+        "is_halted",
+        "stp_cancel_newest_count",
+        "stp_cancel_oldest_count",
+        "stp_decrement_cancel_count",
+        "symbol",
+    )
 
-    def __init__(self, symbol: str, initial_seq: int = 1) -> None:
+    def __init__(
+        self,
+        symbol: str,
+        initial_seq: int = 1,
+        default_stp_policy: STPPolicy = STPPolicy.CANCEL_NEWEST,
+    ) -> None:
         if initial_seq < 1:
             raise ValueError(f"initial_seq must be >= 1, got {initial_seq}")
         self.symbol = symbol
@@ -322,6 +339,10 @@ class MatchingEngine:
         self._seq = initial_seq
         self._trade_count = 0
         self.is_halted = False
+        self.default_stp_policy = default_stp_policy
+        self.stp_cancel_newest_count = 0
+        self.stp_cancel_oldest_count = 0
+        self.stp_decrement_cancel_count = 0
 
     @property
     def book(self) -> OrderBook:
@@ -459,6 +480,8 @@ class MatchingEngine:
         )
 
         remaining_qty = order.qty
+        stp_policy = order.stp if order.stp is not None else self.default_stp_policy
+        order_stp_canceled = False
 
         # 4. Aggressive Matching against opposing side
         while remaining_qty > 0 and not opposing_half.is_empty():
@@ -482,11 +505,94 @@ class MatchingEngine:
                 if front_order is None:
                     break
 
+                # Self-Trade Prevention (STP) check:
+                # Triggers when both orders have non-empty participant_id, they match,
+                # and policy != NONE.
+                is_self_trade = bool(
+                    order.participant_id
+                    and front_order.participant_id
+                    and order.participant_id == front_order.participant_id
+                    and stp_policy != STPPolicy.NONE
+                )
+
+                if is_self_trade:
+                    if stp_policy == STPPolicy.CANCEL_NEWEST:
+                        self.stp_cancel_newest_count += 1
+                        order_stp_canceled = True
+                        events.append(
+                            OrderCanceled(
+                                seq=self._next_seq(),
+                                ts_ns=order.ts_ns,
+                                symbol=self.symbol,
+                                order_id=order.order_id,
+                                reason="STP_CANCEL_NEWEST",
+                            )
+                        )
+                        remaining_qty = 0
+                        break
+
+                    if stp_policy == STPPolicy.CANCEL_OLDEST:
+                        self.stp_cancel_oldest_count += 1
+                        removed = best_level.pop_front()
+                        self._book._orders_map.pop(removed.order_id, None)
+                        events.append(
+                            OrderCanceled(
+                                seq=self._next_seq(),
+                                ts_ns=order.ts_ns,
+                                symbol=self.symbol,
+                                order_id=removed.order_id,
+                                reason="STP_CANCEL_OLDEST",
+                            )
+                        )
+                        continue
+
+                    if stp_policy == STPPolicy.DECREMENT_AND_CANCEL:
+                        self.stp_decrement_cancel_count += 1
+                        overlap = min(remaining_qty, front_order.remaining_qty)
+                        remaining_qty -= overlap
+
+                        if front_order.remaining_qty == overlap:
+                            removed = best_level.pop_front()
+                            self._book._orders_map.pop(removed.order_id, None)
+                            events.append(
+                                OrderCanceled(
+                                    seq=self._next_seq(),
+                                    ts_ns=order.ts_ns,
+                                    symbol=self.symbol,
+                                    order_id=removed.order_id,
+                                    reason="STP_DECREMENT_AND_CANCEL",
+                                )
+                            )
+                        else:
+                            best_level.reduce_front(overlap)
+
+                        if remaining_qty == 0:
+                            order_stp_canceled = True
+                            events.append(
+                                OrderCanceled(
+                                    seq=self._next_seq(),
+                                    ts_ns=order.ts_ns,
+                                    symbol=self.symbol,
+                                    order_id=order.order_id,
+                                    reason="STP_DECREMENT_AND_CANCEL",
+                                )
+                            )
+                            break
+                        continue
+
                 fill_qty = min(remaining_qty, front_order.remaining_qty)
 
-                # Determine buy/sell order IDs
-                buy_id = order.order_id if order.side == Side.BUY else front_order.order_id
-                sell_id = front_order.order_id if order.side == Side.BUY else order.order_id
+                # Determine buy/sell order IDs and participant IDs
+                if order.side == Side.BUY:
+                    buy_id = order.order_id
+                    sell_id = front_order.order_id
+                    buyer_pid = order.participant_id
+                    seller_pid = front_order.participant_id
+                else:
+                    buy_id = front_order.order_id
+                    sell_id = order.order_id
+                    buyer_pid = front_order.participant_id
+                    seller_pid = order.participant_id
 
                 # Emit TradeExecuted
                 trade = TradeExecuted(
@@ -499,6 +605,8 @@ class MatchingEngine:
                     aggressor_side=order.side,
                     buy_order_id=buy_id,
                     sell_order_id=sell_id,
+                    buyer_participant_id=buyer_pid,
+                    seller_participant_id=seller_pid,
                 )
                 events.append(trade)
 
@@ -527,8 +635,11 @@ class MatchingEngine:
                 )
             )
 
+            if order_stp_canceled:
+                break
+
         # 5. Handle remaining quantity
-        if remaining_qty > 0:
+        if remaining_qty > 0 and not order_stp_canceled:
             if order.order_type == OrderType.LIMIT and order.tif == TimeInForce.GTC:
                 assert order.price_ticks is not None
                 resting = RestingOrder(
@@ -540,6 +651,7 @@ class MatchingEngine:
                     ts_ns=order.ts_ns,
                     seq=order.seq,
                     tif=order.tif,
+                    participant_id=order.participant_id,
                 )
                 new_total = self._book.add_resting_order(resting)
                 events.append(
@@ -610,3 +722,16 @@ class MatchingEngine:
             )
         )
         return events
+
+    def get_stp_stats(self) -> dict[str, int]:
+        """Return self-trade prevention telemetry counts."""
+        return {
+            "cancel_newest": self.stp_cancel_newest_count,
+            "cancel_oldest": self.stp_cancel_oldest_count,
+            "decrement_and_cancel": self.stp_decrement_cancel_count,
+            "total_prevented": (
+                self.stp_cancel_newest_count
+                + self.stp_cancel_oldest_count
+                + self.stp_decrement_cancel_count
+            ),
+        }

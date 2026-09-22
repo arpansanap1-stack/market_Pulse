@@ -5,6 +5,8 @@
 
 export type Side = 'BUY' | 'SELL';
 
+export type STPPolicy = 'CANCEL_NEWEST' | 'CANCEL_OLDEST' | 'DECREMENT_AND_CANCEL' | 'NONE';
+
 export interface Trade {
   seq: number;
   ts_ns: number;
@@ -14,6 +16,8 @@ export interface Trade {
   price: number;
   qty: number;
   aggressor_side: Side;
+  buyer_participant_id?: string;
+  seller_participant_id?: string;
 }
 
 export interface TradesChannelData {
@@ -177,10 +181,18 @@ export interface ScenarioDefinition {
   default_params: Record<string, unknown>;
 }
 
+export interface STPStats {
+  cancel_newest: number;
+  cancel_oldest: number;
+  decrement_and_cancel: number;
+  total_prevented: number;
+}
+
 export interface MarketStatus {
   symbol: string;
   is_halted: boolean;
   status: 'ACTIVE' | 'HALTED';
   latest_price: number;
+  stp_stats?: STPStats;
 }
 

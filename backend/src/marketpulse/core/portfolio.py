@@ -22,6 +22,7 @@ from marketpulse.core.events import (
     OrderSubmitted,
     OrderType,
     Side,
+    STPPolicy,
     TimeInForce,
     TradeExecuted,
     ticks_to_price,
@@ -100,6 +101,8 @@ class OrderRecord:
     updated_ts_ns: int = 0
     avg_fill_price_ticks: float | None = None
     reject_reason: str | None = None
+    participant_id: str = ""
+    stp: STPPolicy = STPPolicy.CANCEL_NEWEST
 
     def __post_init__(self) -> None:
         if self.remaining_qty == 0 and self.filled_qty == 0:
@@ -136,6 +139,8 @@ class OrderRecord:
                 else None
             ),
             "reject_reason": self.reject_reason,
+            "participant_id": self.participant_id,
+            "stp": self.stp.value,
         }
 
 
@@ -216,6 +221,8 @@ class PortfolioTracker:
             tif=order.tif,
             created_ts_ns=order.ts_ns,
             updated_ts_ns=order.ts_ns,
+            participant_id=order.participant_id,
+            stp=order.stp,
         )
         self.orders[order.order_id] = record
         self.order_history.append(record)
@@ -241,6 +248,7 @@ class PortfolioTracker:
         order = self.orders.get(event.order_id)
         if order is not None:
             order.status = OrderStatus.CANCELED
+            order.reject_reason = event.reason
             order.updated_ts_ns = event.ts_ns
 
     def on_trade_executed(self, trade: TradeExecuted, user_order_id: str, side: Side) -> None:
