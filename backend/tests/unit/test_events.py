@@ -209,9 +209,7 @@ def strategy_order_submitted(draw: st.DrawFn) -> OrderSubmitted:
         OrderType.STOP_LIMIT,
         OrderType.TAKE_PROFIT_LIMIT,
     )
-    price_ticks = (
-        draw(st.integers(min_value=1, max_value=500_000)) if is_limit else None
-    )
+    price_ticks = draw(st.integers(min_value=1, max_value=500_000)) if is_limit else None
     stop_types = (
         OrderType.STOP_LOSS,
         OrderType.STOP_LIMIT,
@@ -219,9 +217,7 @@ def strategy_order_submitted(draw: st.DrawFn) -> OrderSubmitted:
         OrderType.TAKE_PROFIT_LIMIT,
     )
     stop_price_ticks = (
-        draw(st.integers(min_value=1, max_value=500_000))
-        if order_type in stop_types
-        else None
+        draw(st.integers(min_value=1, max_value=500_000)) if order_type in stop_types else None
     )
     trail_offset_ticks = (
         draw(st.integers(min_value=1, max_value=50_000))
@@ -435,4 +431,3 @@ def test_order_triggered_event() -> None:
             trigger_price_ticks=-10,
             execution_type=OrderType.MARKET,
         )
-

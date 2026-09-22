@@ -322,4 +322,3 @@ def test_multisymbol_session_and_symbols_endpoint(client: TestClient) -> None:
         book_res = client.get(f"/api/v1/book?symbol={sym}&levels=5")
         assert book_res.status_code == 200
         assert book_res.json()["symbol"] == sym
-

@@ -20,12 +20,12 @@ class MultiplexedAgentSource(EventSource):
 
     __slots__ = (
         "_clock",
+        "_events_emitted",
+        "_heap",
+        "_heap_initialized",
         "_max_events",
         "_sources",
-        "_heap",
-        "_events_emitted",
         "_sources_by_symbol",
-        "_heap_initialized",
         "_tie_breaker",
     )
 
@@ -43,7 +43,7 @@ class MultiplexedAgentSource(EventSource):
         self._max_events = max_events
         self._clock = clock
         self._events_emitted = 0
-        
+
         self._sources: list[AgentOrderSource] = []
         for i, symbol in enumerate(symbols):
             source_seed = seed + i
@@ -57,7 +57,7 @@ class MultiplexedAgentSource(EventSource):
                 clock=clock,
             )
             self._sources.append(source)
-            
+
         self._heap: list[tuple[int, int, Event, Iterator[Event]]] = []
         self._sources_by_symbol = {s._symbol: s for s in self._sources}
         self._heap_initialized = False
@@ -68,7 +68,7 @@ class MultiplexedAgentSource(EventSource):
         if symbol not in self._sources_by_symbol:
             raise KeyError(f"No source configured for symbol {symbol}")
         return self._sources_by_symbol[symbol]
-        
+
     def get_engine(self, symbol: str) -> Any:
         """Get the underlying MatchingEngine for a symbol."""
         return self.get_source(symbol).engine
@@ -82,7 +82,10 @@ class MultiplexedAgentSource(EventSource):
             iterator = source.stream()
             try:
                 first_event = next(iterator)
-                heapq.heappush(self._heap, (first_event.ts_ns, self._tie_breaker, first_event, iterator))
+                heapq.heappush(
+                    self._heap,
+                    (first_event.ts_ns, self._tie_breaker, first_event, iterator),
+                )
                 self._tie_breaker += 1
             except StopIteration:
                 pass
@@ -91,27 +94,30 @@ class MultiplexedAgentSource(EventSource):
         """Produce the next sequenced event chronologically across all sources."""
         if not self._heap_initialized:
             self._initialize_heap()
-            
+
         if not self._heap:
             return None
-            
+
         if self._max_events is not None and self._events_emitted >= self._max_events:
             return None
-            
+
         ts_ns, _, event, iterator = heapq.heappop(self._heap)
-        
+
         if isinstance(self._clock, SimulatedClock):
             self._clock.set_time(ts_ns)
-            
+
         self._events_emitted += 1
-        
+
         try:
             next_evt = next(iterator)
-            heapq.heappush(self._heap, (next_evt.ts_ns, self._tie_breaker, next_evt, iterator))
+            heapq.heappush(
+                self._heap,
+                (next_evt.ts_ns, self._tie_breaker, next_evt, iterator),
+            )
             self._tie_breaker += 1
         except StopIteration:
             pass
-            
+
         return event
 
     def stream(self) -> Iterator[Event]:

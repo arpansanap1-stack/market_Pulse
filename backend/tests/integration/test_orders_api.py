@@ -432,4 +432,3 @@ def test_oco_validation_rollback(client: TestClient) -> None:
     # No open orders should remain
     open_orders = client.get("/api/v1/orders?status=open").json()
     assert len(open_orders) == 0
-

@@ -58,7 +58,6 @@ from marketpulse.core.scenarios import (
     create_volatility_regime,
     get_available_scenarios,
 )
-from marketpulse.sim.agent_source import AgentOrderSource
 from marketpulse.sim.multiplex_source import MultiplexedAgentSource
 from marketpulse.sim.replay_source import ReplayEventSource
 from marketpulse.storage.event_store import SessionMetadata, SQLiteEventStore
@@ -271,7 +270,9 @@ class SimulationRunner:
 
         # Log canonical SessionStarted event
         evt_start = SessionStarted(
-            seq=self.source.get_engine(primary_symbol).allocate_seq() if self.source and config.symbols else 1,
+            seq=self.source.get_engine(primary_symbol).allocate_seq()
+            if self.source and config.symbols
+            else 1,
             ts_ns=start_ts_ns,
             symbol=primary_symbol,
             session_id=session_id,
@@ -293,8 +294,14 @@ class SimulationRunner:
         if self.mode == RunnerMode.LIVE and self.active_session_id:
             now_ns = self.source._clock.now_ns() if self.source and self.source._clock else 0
             total_evts = self.store.count_events(self.active_session_id)
-            primary_symbol = self.current_config.symbol or (self.current_config.symbols[0] if self.current_config.symbols else "AAPL")
-            seq = self.source.get_engine(primary_symbol).allocate_seq() if self.source and self.current_config.symbols else total_evts + 1
+            primary_symbol = self.current_config.symbol or (
+                self.current_config.symbols[0] if self.current_config.symbols else "AAPL"
+            )
+            seq = (
+                self.source.get_engine(primary_symbol).allocate_seq()
+                if self.source and self.current_config.symbols
+                else total_evts + 1
+            )
             evt_end = SessionEnded(
                 seq=seq,
                 ts_ns=now_ns,
@@ -431,9 +438,15 @@ class SimulationRunner:
             current_seq = self._current_seq
             total_events = self._total_events
             speed = 1.0
-            is_halted = any(self.source.get_engine(s).is_halted for s in self.current_config.symbols) if self.source else False
+            is_halted = (
+                any(self.source.get_engine(s).is_halted for s in self.current_config.symbols)
+                if self.source
+                else False
+            )
 
-        primary_symbol = self.current_config.symbol or (self.current_config.symbols[0] if self.current_config.symbols else "AAPL")
+        primary_symbol = self.current_config.symbol or (
+            self.current_config.symbols[0] if self.current_config.symbols else "AAPL"
+        )
         return {
             "mode": self.mode.value,
             "session_id": self.active_session_id,
@@ -473,7 +486,9 @@ class SimulationRunner:
                 self.portfolio.on_trade_executed(event, event.buy_order_id, Side.BUY)
                 p_buy = self.portfolio.orders[event.buy_order_id]
                 if p_buy.status == OrderStatus.FILLED:
-                    oco_cancels = self.advanced_orders[event.symbol].on_order_filled(event.buy_order_id)
+                    oco_cancels = self.advanced_orders[event.symbol].on_order_filled(
+                        event.buy_order_id
+                    )
                     for cancel_id in oco_cancels:
                         self._cancel_oco_companion(cancel_id, event.ts_ns, event.symbol)
                 if broadcast:
@@ -487,7 +502,9 @@ class SimulationRunner:
                 self.portfolio.on_trade_executed(event, event.sell_order_id, Side.SELL)
                 p_sell = self.portfolio.orders[event.sell_order_id]
                 if p_sell.status == OrderStatus.FILLED:
-                    oco_cancels = self.advanced_orders[event.symbol].on_order_filled(event.sell_order_id)
+                    oco_cancels = self.advanced_orders[event.symbol].on_order_filled(
+                        event.sell_order_id
+                    )
                     for cancel_id in oco_cancels:
                         self._cancel_oco_companion(cancel_id, event.ts_ns, event.symbol)
                 if broadcast:
@@ -593,7 +610,9 @@ class SimulationRunner:
 
         elif isinstance(event, BookDelta):
             price = ticks_to_price(event.price_ticks, self.current_config.tick_size)
-            self.depth_trackers[event.symbol].on_delta(event.side, event.price_ticks, event.new_total_qty)
+            self.depth_trackers[event.symbol].on_delta(
+                event.side, event.price_ticks, event.new_total_qty
+            )
             delta_dict: dict[str, Any] = {
                 "seq": event.seq,
                 "ts_ns": event.ts_ns,
@@ -671,7 +690,11 @@ class SimulationRunner:
 
         params = custom_params or {}
         symbol = str(params.get("symbol", self.current_config.symbols[0]))
-        clock_ns = self.source._clock.now_ns() if self.source is not None and self.source._clock is not None else 0
+        clock_ns = (
+            self.source._clock.now_ns()
+            if self.source is not None and self.source._clock is not None
+            else 0
+        )
         events_to_inject: list[MarketEvent] = []
 
         if scenario_id in ("earnings_shock_positive", "earnings_shock_negative", "earnings_shock"):
@@ -1117,9 +1140,18 @@ def create_app(
         tick_size = sim_runner.current_config.tick_size
         if sim_runner.mode == RunnerMode.REPLAY:
             dt = sim_runner.depth_trackers.get(symbol)
-            snapshot = dt.snapshot(max_levels=levels) if dt else {
-                "bids": [], "asks": [], "best_bid": None, "best_ask": None, "spread": None, "mid_price_ticks": None
-            }
+            snapshot = (
+                dt.snapshot(max_levels=levels)
+                if dt
+                else {
+                    "bids": [],
+                    "asks": [],
+                    "best_bid": None,
+                    "best_ask": None,
+                    "spread": None,
+                    "mid_price_ticks": None,
+                }
+            )
             is_halted = sim_runner._replay_halted
         elif sim_runner.source is not None:
             snapshot = sim_runner.source.get_source(symbol).book_snapshot(max_levels=levels)
@@ -1403,7 +1435,11 @@ def create_app(
 
         stp_stats = (
             sim_runner.source.get_engine(symbol).get_stp_stats()
-            if (sim_runner.source and sim_runner.mode == RunnerMode.LIVE and symbol in sim_runner.current_config.symbols)
+            if (
+                sim_runner.source
+                and sim_runner.mode == RunnerMode.LIVE
+                and symbol in sim_runner.current_config.symbols
+            )
             else {
                 "cancel_newest": 0,
                 "cancel_oldest": 0,
@@ -1471,7 +1507,9 @@ def create_app(
     async def get_portfolio(symbol: str = "AAPL") -> dict[str, Any]:
         """Return paper trading account balance, equity, and position inventory."""
         tick_size = sim_runner.current_config.tick_size
-        current_price = sim_runner._latest_prices.get(symbol, sim_runner.current_config.initial_price)
+        current_price = sim_runner._latest_prices.get(
+            symbol, sim_runner.current_config.initial_price
+        )
         current_ticks = price_to_ticks(current_price, tick_size)
         return sim_runner.portfolio.get_summary(
             current_price_ticks=current_ticks,
@@ -1489,7 +1527,9 @@ def create_app(
             tick_size=tick_size,
         )
         primary_symbol = sim_runner.current_config.symbols[0]
-        current_price = sim_runner._latest_prices.get(primary_symbol, sim_runner.current_config.initial_price)
+        current_price = sim_runner._latest_prices.get(
+            primary_symbol, sim_runner.current_config.initial_price
+        )
         current_ticks = price_to_ticks(current_price, tick_size)
         summary = sim_runner.portfolio.get_summary(
             current_price_ticks=current_ticks,

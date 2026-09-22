@@ -15,7 +15,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, cast
 
-from sortedcontainers import SortedDict
+from sortedcontainers import SortedDict  # type: ignore[import-untyped]
 
 from marketpulse.core.events import (
     BookDelta,

@@ -190,9 +190,8 @@ class OrderSubmitted(Event):
                 raise ValueError(
                     f"{self.order_type} requires limit price_ticks > 0, got {self.price_ticks}"
                 )
-        elif (
-            self.order_type == OrderType.TRAILING_STOP
-            and (self.trail_offset_ticks is None or self.trail_offset_ticks <= 0)
+        elif self.order_type == OrderType.TRAILING_STOP and (
+            self.trail_offset_ticks is None or self.trail_offset_ticks <= 0
         ):
             raise ValueError(
                 f"TRAILING_STOP requires trail_offset_ticks > 0, got {self.trail_offset_ticks}"

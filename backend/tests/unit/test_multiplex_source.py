@@ -63,7 +63,7 @@ def test_multiplex_source_determinism() -> None:
     evts2 = list(src2.stream())
 
     assert len(evts1) == len(evts2) == 50
-    for e1, e2 in zip(evts1, evts2):
+    for e1, e2 in zip(evts1, evts2, strict=True):
         assert type(e1) is type(e2)
         assert e1.seq == e2.seq
         assert e1.ts_ns == e2.ts_ns
@@ -80,6 +80,6 @@ def test_multiplex_source_reset() -> None:
     second_run = list(source.stream())
 
     assert len(first_run) == len(second_run) == 30
-    for e1, e2 in zip(first_run, second_run):
+    for e1, e2 in zip(first_run, second_run, strict=True):
         assert e1.ts_ns == e2.ts_ns
         assert getattr(e1, "symbol", None) == getattr(e2, "symbol", None)

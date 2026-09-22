@@ -69,7 +69,7 @@ module = "pandas.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "sortedcontainers.*"
+module = ["sortedcontainers", "sortedcontainers.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

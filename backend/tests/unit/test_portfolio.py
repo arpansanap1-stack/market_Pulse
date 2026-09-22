@@ -1,6 +1,5 @@
 """Unit tests for PortfolioTracker, Position, and OrderRecord pure domain logic."""
 
-
 from marketpulse.core.events import (
     OrderAccepted,
     OrderCanceled,
