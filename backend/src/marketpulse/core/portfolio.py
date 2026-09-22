@@ -38,6 +38,8 @@ class OrderStatus(StrEnum):
     FILLED = "FILLED"
     CANCELED = "CANCELED"
     REJECTED = "REJECTED"
+    UNTRIGGERED = "UNTRIGGERED"
+    TRIGGERED = "TRIGGERED"
 
 
 @dataclass(slots=True)
@@ -103,6 +105,10 @@ class OrderRecord:
     reject_reason: str | None = None
     participant_id: str = ""
     stp: STPPolicy = STPPolicy.CANCEL_NEWEST
+    stop_price_ticks: int | None = None
+    trail_offset_ticks: int | None = None
+    oco_group_id: str | None = None
+    current_stop_ticks: int | None = None
 
     def __post_init__(self) -> None:
         if self.remaining_qty == 0 and self.filled_qty == 0:
@@ -112,6 +118,21 @@ class OrderRecord:
         """Serialize order record to dictionary."""
         price = (
             ticks_to_price(self.price_ticks, tick_size) if self.price_ticks is not None else None
+        )
+        stop_price = (
+            ticks_to_price(self.stop_price_ticks, tick_size)
+            if self.stop_price_ticks is not None
+            else None
+        )
+        trail_offset = (
+            ticks_to_price(self.trail_offset_ticks, tick_size)
+            if self.trail_offset_ticks is not None
+            else None
+        )
+        current_stop = (
+            ticks_to_price(self.current_stop_ticks, tick_size)
+            if self.current_stop_ticks is not None
+            else None
         )
         avg_fill_price = (
             round(self.avg_fill_price_ticks * tick_size, 4)
@@ -141,6 +162,13 @@ class OrderRecord:
             "reject_reason": self.reject_reason,
             "participant_id": self.participant_id,
             "stp": self.stp.value,
+            "stop_price": stop_price,
+            "stop_price_ticks": self.stop_price_ticks,
+            "trail_offset": trail_offset,
+            "trail_offset_ticks": self.trail_offset_ticks,
+            "oco_group_id": self.oco_group_id,
+            "current_stop": current_stop,
+            "current_stop_ticks": self.current_stop_ticks,
         }
 
 
@@ -186,7 +214,12 @@ class PortfolioTracker:
         if qty <= 0:
             return False, "Quantity must be positive"
 
-        if order_type == OrderType.LIMIT:
+        is_limit_type = order_type in (
+            OrderType.LIMIT,
+            OrderType.STOP_LIMIT,
+            OrderType.TAKE_PROFIT_LIMIT,
+        )
+        if is_limit_type:
             if price_ticks is None or price_ticks <= 0:
                 return False, "Limit orders require price > 0"
             required_price = price_ticks
@@ -208,6 +241,14 @@ class PortfolioTracker:
 
     def on_order_submitted(self, order: OrderSubmitted) -> OrderRecord:
         """Record order submission."""
+        is_synthetic = order.order_type in (
+            OrderType.STOP_LOSS,
+            OrderType.STOP_LIMIT,
+            OrderType.TAKE_PROFIT,
+            OrderType.TAKE_PROFIT_LIMIT,
+            OrderType.TRAILING_STOP,
+        )
+        initial_status = OrderStatus.UNTRIGGERED if is_synthetic else OrderStatus.PENDING
         record = OrderRecord(
             order_id=order.order_id,
             symbol=order.symbol,
@@ -217,21 +258,39 @@ class PortfolioTracker:
             qty=order.qty,
             filled_qty=0,
             remaining_qty=order.qty,
-            status=OrderStatus.PENDING,
+            status=initial_status,
             tif=order.tif,
             created_ts_ns=order.ts_ns,
             updated_ts_ns=order.ts_ns,
             participant_id=order.participant_id,
             stp=order.stp,
+            stop_price_ticks=order.stop_price_ticks,
+            trail_offset_ticks=order.trail_offset_ticks,
+            oco_group_id=order.oco_group_id,
+            current_stop_ticks=order.stop_price_ticks,
         )
         self.orders[order.order_id] = record
         self.order_history.append(record)
         return record
 
+    def on_order_triggered(self, order_id: str, ts_ns: int) -> None:
+        """Mark synthetic order as triggered."""
+        order = self.orders.get(order_id)
+        if order is not None and order.status == OrderStatus.UNTRIGGERED:
+            order.status = OrderStatus.TRIGGERED
+            order.updated_ts_ns = ts_ns
+
+    def update_stop_price(self, order_id: str, current_stop_ticks: int, ts_ns: int) -> None:
+        """Update dynamic stop price on a working trailing stop order."""
+        order = self.orders.get(order_id)
+        if order is not None:
+            order.current_stop_ticks = current_stop_ticks
+            order.updated_ts_ns = ts_ns
+
     def on_order_accepted(self, event: OrderAccepted) -> None:
         """Handle order acceptance into the matching engine."""
         order = self.orders.get(event.order_id)
-        if order is not None and order.status == OrderStatus.PENDING:
+        if order is not None and order.status in (OrderStatus.PENDING, OrderStatus.TRIGGERED):
             order.status = OrderStatus.OPEN
             order.updated_ts_ns = event.ts_ns
 
@@ -390,13 +449,26 @@ class PortfolioTracker:
             "open_orders_count": sum(
                 1
                 for o in self.orders.values()
-                if o.status in (OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
+                if o.status
+                in (
+                    OrderStatus.PENDING,
+                    OrderStatus.OPEN,
+                    OrderStatus.PARTIALLY_FILLED,
+                    OrderStatus.UNTRIGGERED,
+                    OrderStatus.TRIGGERED,
+                )
             ),
         }
 
     def get_open_orders(self) -> list[dict[str, Any]]:
         """Return list of resting/active user orders."""
-        active_statuses = (OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
+        active_statuses = (
+            OrderStatus.PENDING,
+            OrderStatus.OPEN,
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.UNTRIGGERED,
+            OrderStatus.TRIGGERED,
+        )
         return [
             o.to_dict(self.tick_size) for o in self.orders.values() if o.status in active_statuses
         ]

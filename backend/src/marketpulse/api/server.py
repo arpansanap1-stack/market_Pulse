@@ -8,7 +8,7 @@ import logging
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from enum import StrEnum
 from typing import Any
 
@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from marketpulse.api.broadcaster import Broadcaster
+from marketpulse.core.advanced_orders import AdvancedOrderManager, TriggerOrder
 from marketpulse.core.anomaly import StreamingAnomalyDetector
 from marketpulse.core.events import (
     BookDelta,
@@ -122,6 +123,16 @@ class OrderSubmitRequest(BaseModel):
     tif: TimeInForce = Field(default=TimeInForce.GTC)
     participant_id: str = Field(default="user_trader")
     stp: STPPolicy = Field(default=STPPolicy.CANCEL_NEWEST)
+    stop_price: float | None = Field(default=None, gt=0)
+    trail_offset: float | None = Field(default=None, gt=0)
+    oco_group_id: str | None = Field(default=None)
+
+
+class OCOOrderSubmitRequest(BaseModel):
+    """Request payload to atomically submit an OCO order pair."""
+
+    order_a: OrderSubmitRequest
+    order_b: OrderSubmitRequest
 
 
 class PortfolioResetRequest(BaseModel):
@@ -193,6 +204,7 @@ class SimulationRunner:
         self.aggregator: OHLCAggregator = OHLCAggregator(symbol="AAPL")
         self.anomaly_detector: StreamingAnomalyDetector = StreamingAnomalyDetector(symbol="AAPL")
         self.portfolio: PortfolioTracker = PortfolioTracker()
+        self.advanced_orders: AdvancedOrderManager = AdvancedOrderManager()
         self._sim_task: asyncio.Task[None] | None = None
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._running: bool = False
@@ -211,6 +223,7 @@ class SimulationRunner:
         self.aggregator = OHLCAggregator(symbol=self.current_config.symbol)
         self.anomaly_detector = StreamingAnomalyDetector(symbol=self.current_config.symbol)
         self.portfolio.reset(initial_cash=100_000.0, tick_size=self.current_config.tick_size)
+        self.advanced_orders.clear()
         self._latest_price = self.current_config.initial_price
 
     def start(self, config: SessionConfigRequest) -> str:
@@ -435,6 +448,11 @@ class SimulationRunner:
             # Portfolio execution fill updates
             if event.buy_order_id in self.portfolio.orders:
                 self.portfolio.on_trade_executed(event, event.buy_order_id, Side.BUY)
+                p_buy = self.portfolio.orders[event.buy_order_id]
+                if p_buy.status == OrderStatus.FILLED:
+                    oco_cancels = self.advanced_orders.on_order_filled(event.buy_order_id)
+                    for cancel_id in oco_cancels:
+                        self._cancel_oco_companion(cancel_id, event.ts_ns, event.symbol)
                 if broadcast:
                     summary = self.portfolio.get_summary(
                         current_price_ticks=event.price_ticks,
@@ -444,7 +462,66 @@ class SimulationRunner:
                     self.broadcaster.push_portfolio(summary)
             if event.sell_order_id in self.portfolio.orders:
                 self.portfolio.on_trade_executed(event, event.sell_order_id, Side.SELL)
+                p_sell = self.portfolio.orders[event.sell_order_id]
+                if p_sell.status == OrderStatus.FILLED:
+                    oco_cancels = self.advanced_orders.on_order_filled(event.sell_order_id)
+                    for cancel_id in oco_cancels:
+                        self._cancel_oco_companion(cancel_id, event.ts_ns, event.symbol)
                 if broadcast:
+                    summary = self.portfolio.get_summary(
+                        current_price_ticks=event.price_ticks,
+                        tick_size=self.current_config.tick_size,
+                        symbol=event.symbol,
+                    )
+                    self.broadcaster.push_portfolio(summary)
+
+            # Evaluate synthetic trigger orders (Phase 8A)
+            if self.mode == RunnerMode.LIVE and self.source is not None:
+                activated, oco_cancels, stops = self.advanced_orders.on_trade(
+                    trade_price_ticks=event.price_ticks,
+                    ts_ns=event.ts_ns,
+                    symbol=event.symbol,
+                    seq_fn=self.source.engine.allocate_seq,
+                )
+                for ord_id, new_stop in stops:
+                    self.portfolio.update_stop_price(ord_id, new_stop, event.ts_ns)
+
+                for cancel_id in oco_cancels:
+                    self._cancel_oco_companion(cancel_id, event.ts_ns, event.symbol)
+
+                for sub_evt, trig_evt in activated:
+                    self.store.append_event(self.active_session_id, trig_evt)
+                    self._current_seq = trig_evt.seq
+                    self._total_events = trig_evt.seq
+                    self.portfolio.on_order_triggered(trig_evt.parent_order_id, trig_evt.ts_ns)
+
+                    # Submit activated order into continuous matching engine
+                    self.store.append_event(self.active_session_id, sub_evt)
+                    self._current_seq = sub_evt.seq
+                    self._total_events = sub_evt.seq
+                    matching_events = self.source.engine.submit_order(sub_evt)
+                    for m_evt in matching_events:
+                        self.store.append_event(self.active_session_id, m_evt)
+                        self._current_seq = m_evt.seq
+                        self._total_events = m_evt.seq
+                        if (
+                            isinstance(m_evt, OrderAccepted)
+                            and m_evt.order_id in self.portfolio.orders
+                        ):
+                            self.portfolio.on_order_accepted(m_evt)
+                        elif (
+                            isinstance(m_evt, OrderRejected)
+                            and m_evt.order_id in self.portfolio.orders
+                        ):
+                            self.portfolio.on_order_rejected(m_evt)
+                        elif (
+                            isinstance(m_evt, OrderCanceled)
+                            and m_evt.order_id in self.portfolio.orders
+                        ):
+                            self.portfolio.on_order_canceled(m_evt)
+                        self._process_event(m_evt, broadcast=broadcast)
+
+                if (activated or oco_cancels or stops) and broadcast:
                     summary = self.portfolio.get_summary(
                         current_price_ticks=event.price_ticks,
                         tick_size=self.current_config.tick_size,
@@ -522,6 +599,45 @@ class SimulationRunner:
             self.recent_market_events.append(event_dict)
             if broadcast:
                 self.broadcaster.push_market_event(event.symbol, event_dict)
+
+    def _cancel_oco_companion(self, cancel_id: str, ts_ns: int, symbol: str) -> None:
+        """Cancel an OCO companion order in the OMS or matching engine."""
+        if cancel_id not in self.portfolio.orders:
+            return
+        p_order = self.portfolio.orders[cancel_id]
+        if p_order.status == OrderStatus.UNTRIGGERED:
+            if self.source is not None:
+                seq = self.source.engine.allocate_seq()
+            else:
+                self._current_seq += 1
+                seq = self._current_seq
+            c_evt = OrderCanceled(
+                seq=seq,
+                ts_ns=ts_ns,
+                symbol=symbol,
+                order_id=cancel_id,
+                reason="OCO_TRIGGERED",
+            )
+            self.store.append_event(self.active_session_id, c_evt)
+            self._current_seq = seq
+            self._total_events = seq
+            self.portfolio.on_order_canceled(c_evt)
+        elif p_order.status in (
+            OrderStatus.PENDING,
+            OrderStatus.OPEN,
+            OrderStatus.PARTIALLY_FILLED,
+        ):
+            if self.source is not None:
+                engine_cancels = self.source.engine.cancel_order(
+                    cancel_id, ts_ns=ts_ns, reason="OCO_TRIGGERED"
+                )
+                for ce in engine_cancels:
+                    self.store.append_event(self.active_session_id, ce)
+                    self._current_seq = ce.seq
+                    self._total_events = ce.seq
+                    if isinstance(ce, OrderCanceled) and ce.order_id == cancel_id:
+                        self.portfolio.on_order_canceled(ce)
+                    self._process_event(ce, broadcast=True)
 
     def inject_scenario(
         self, scenario_id: str, custom_params: dict[str, Any] | None = None
@@ -623,7 +739,7 @@ class SimulationRunner:
         return injected
 
     def submit_user_order(self, req: OrderSubmitRequest) -> dict[str, Any]:
-        """Validate, persist, and submit a user order to the matching engine."""
+        """Validate, persist, and submit a user order to the OMS trigger book or matching engine."""
         if self.mode != RunnerMode.LIVE or self.source is None:
             raise RuntimeError("Live simulation is not running")
 
@@ -631,14 +747,50 @@ class SimulationRunner:
             raise RuntimeError("Market is currently halted by circuit breaker")
 
         tick_size = self.current_config.tick_size
-        if req.order_type == OrderType.LIMIT:
+        is_synthetic = req.order_type in (
+            OrderType.STOP_LOSS,
+            OrderType.STOP_LIMIT,
+            OrderType.TAKE_PROFIT,
+            OrderType.TAKE_PROFIT_LIMIT,
+            OrderType.TRAILING_STOP,
+        )
+
+        # Validate limit price
+        if req.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT, OrderType.TAKE_PROFIT_LIMIT):
             if req.price is None or req.price <= 0:
-                raise ValueError("Limit orders require a positive price")
+                raise ValueError(f"{req.order_type.value} orders require a positive price")
             price_ticks: int | None = price_to_ticks(req.price, tick_size)
             est_ticks = price_ticks
         else:
             price_ticks = None
             est_ticks = price_to_ticks(self._latest_price, tick_size)
+
+        # Validate stop price
+        if req.order_type in (
+            OrderType.STOP_LOSS,
+            OrderType.STOP_LIMIT,
+            OrderType.TAKE_PROFIT,
+            OrderType.TAKE_PROFIT_LIMIT,
+        ):
+            if req.stop_price is None or req.stop_price <= 0:
+                raise ValueError(f"{req.order_type.value} orders require a positive stop_price")
+            stop_price_ticks: int | None = price_to_ticks(req.stop_price, tick_size)
+        else:
+            stop_price_ticks = (
+                price_to_ticks(req.stop_price, tick_size) if req.stop_price is not None else None
+            )
+
+        # Validate trail offset
+        if req.order_type == OrderType.TRAILING_STOP:
+            if req.trail_offset is None or req.trail_offset <= 0:
+                raise ValueError("TRAILING_STOP orders require a positive trail_offset")
+            trail_offset_ticks: int | None = price_to_ticks(req.trail_offset, tick_size)
+        else:
+            trail_offset_ticks = (
+                price_to_ticks(req.trail_offset, tick_size)
+                if req.trail_offset is not None
+                else None
+            )
 
         valid, err = self.portfolio.validate_order(
             symbol=req.symbol,
@@ -667,6 +819,9 @@ class SimulationRunner:
             tif=req.tif,
             participant_id=req.participant_id,
             stp=req.stp,
+            stop_price_ticks=stop_price_ticks,
+            trail_offset_ticks=trail_offset_ticks,
+            oco_group_id=req.oco_group_id,
         )
 
         self.store.append_event(self.active_session_id, order_evt)
@@ -675,19 +830,41 @@ class SimulationRunner:
 
         self.portfolio.on_order_submitted(order_evt)
 
-        # Submit to matching engine
-        matching_events = self.source.engine.submit_order(order_evt)
-        for evt in matching_events:
-            self.store.append_event(self.active_session_id, evt)
-            self._current_seq = evt.seq
-            self._total_events = evt.seq
-            if isinstance(evt, OrderAccepted) and evt.order_id in self.portfolio.orders:
-                self.portfolio.on_order_accepted(evt)
-            elif isinstance(evt, OrderRejected) and evt.order_id in self.portfolio.orders:
-                self.portfolio.on_order_rejected(evt)
-            elif isinstance(evt, OrderCanceled) and evt.order_id in self.portfolio.orders:
-                self.portfolio.on_order_canceled(evt)
-            self._process_event(evt, broadcast=True)
+        if is_synthetic:
+            # Register in OMS Trigger Book; do not submit to MatchingEngine yet
+            trigger_ord = TriggerOrder(
+                order_id=order_id,
+                symbol=req.symbol,
+                side=req.side,
+                order_type=req.order_type,
+                qty=req.qty,
+                price_ticks=price_ticks,
+                stop_price_ticks=stop_price_ticks,
+                trail_offset_ticks=trail_offset_ticks,
+                oco_group_id=req.oco_group_id,
+                participant_id=req.participant_id,
+                stp=req.stp,
+                tif=req.tif,
+                created_ts_ns=ts_ns,
+            )
+            self.advanced_orders.register_order(trigger_ord)
+        else:
+            if req.oco_group_id:
+                self.advanced_orders.register_oco_member(order_id, req.oco_group_id)
+
+            # Submit active Limit/Market order to matching engine
+            matching_events = self.source.engine.submit_order(order_evt)
+            for evt in matching_events:
+                self.store.append_event(self.active_session_id, evt)
+                self._current_seq = evt.seq
+                self._total_events = evt.seq
+                if isinstance(evt, OrderAccepted) and evt.order_id in self.portfolio.orders:
+                    self.portfolio.on_order_accepted(evt)
+                elif isinstance(evt, OrderRejected) and evt.order_id in self.portfolio.orders:
+                    self.portfolio.on_order_rejected(evt)
+                elif isinstance(evt, OrderCanceled) and evt.order_id in self.portfolio.orders:
+                    self.portfolio.on_order_canceled(evt)
+                self._process_event(evt, broadcast=True)
 
         current_ticks = price_to_ticks(self._latest_price, tick_size)
         summary = self.portfolio.get_summary(current_ticks, tick_size, req.symbol)
@@ -695,8 +872,32 @@ class SimulationRunner:
 
         return self.portfolio.orders[order_id].to_dict(tick_size)
 
+    def submit_oco_orders(self, req: OCOOrderSubmitRequest) -> dict[str, Any]:
+        """Atomically submit an OCO order pair sharing an oco_group_id."""
+        if self.mode != RunnerMode.LIVE or self.source is None:
+            raise RuntimeError("Live simulation is not running")
+
+        oco_group_id = f"oco_{uuid.uuid4().hex[:8]}"
+        req.order_a.oco_group_id = oco_group_id
+        req.order_b.oco_group_id = oco_group_id
+
+        res_a = self.submit_user_order(req.order_a)
+        try:
+            res_b = self.submit_user_order(req.order_b)
+        except Exception as e:
+            # Atomic rollback: cancel order A if order B submission fails
+            with suppress(Exception):
+                self.cancel_user_order(res_a["order_id"])
+            raise e
+
+        return {
+            "oco_group_id": oco_group_id,
+            "order_a": res_a,
+            "order_b": res_b,
+        }
+
     def cancel_user_order(self, order_id: str) -> dict[str, Any]:
-        """Cancel an active user order in the matching engine."""
+        """Cancel an active user order in the matching engine or OMS trigger book."""
         if self.mode != RunnerMode.LIVE or self.source is None:
             raise RuntimeError("Live simulation is not running")
 
@@ -708,20 +909,34 @@ class SimulationRunner:
             OrderStatus.PENDING,
             OrderStatus.OPEN,
             OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.UNTRIGGERED,
+            OrderStatus.TRIGGERED,
         ):
             raise ValueError(f"Cannot cancel order in status '{order.status.value}'")
 
         ts_ns = self.source._clock.now_ns()
-        cancel_events = self.source.engine.cancel_order(
-            order_id, ts_ns=ts_ns, reason="USER_REQUESTED"
-        )
-        for evt in cancel_events:
-            self.store.append_event(self.active_session_id, evt)
-            self._current_seq = evt.seq
-            self._total_events = evt.seq
-            if isinstance(evt, OrderCanceled) and evt.order_id == order_id:
-                self.portfolio.on_order_canceled(evt)
-            self._process_event(evt, broadcast=True)
+
+        if order.status == OrderStatus.UNTRIGGERED:
+            canceled_ids = self.advanced_orders.cancel_order(order_id)
+            for cid in canceled_ids:
+                self._cancel_oco_companion(cid, ts_ns, order.symbol)
+        else:
+            cancel_events = self.source.engine.cancel_order(
+                order_id, ts_ns=ts_ns, reason="USER_REQUESTED"
+            )
+            for evt in cancel_events:
+                self.store.append_event(self.active_session_id, evt)
+                self._current_seq = evt.seq
+                self._total_events = evt.seq
+                if isinstance(evt, OrderCanceled) and evt.order_id == order_id:
+                    self.portfolio.on_order_canceled(evt)
+                self._process_event(evt, broadcast=True)
+
+            # Check if order had OCO companions to cancel in OMS
+            peers = self.advanced_orders.cancel_order(order_id)
+            for peer_id in peers:
+                if peer_id != order_id:
+                    self._cancel_oco_companion(peer_id, ts_ns, order.symbol)
 
         tick_size = self.current_config.tick_size
         current_ticks = price_to_ticks(self._latest_price, tick_size)
@@ -1170,9 +1385,19 @@ def create_app(
 
     @app.post("/api/v1/orders")
     async def place_order(req: OrderSubmitRequest) -> dict[str, Any]:
-        """Submit a manual limit or market order to the matching engine."""
+        """Submit a manual limit, market, or synthetic trigger order."""
         try:
             return sim_runner.submit_user_order(req)
+        except KeyError as err:
+            raise HTTPException(status_code=404, detail=str(err)) from err
+        except (ValueError, RuntimeError) as err:
+            raise HTTPException(status_code=400, detail=str(err)) from err
+
+    @app.post("/api/v1/orders/oco")
+    async def place_oco_orders(req: OCOOrderSubmitRequest) -> dict[str, Any]:
+        """Submit an atomic One-Cancels-the-Other (OCO) order pair."""
+        try:
+            return sim_runner.submit_oco_orders(req)
         except KeyError as err:
             raise HTTPException(status_code=404, detail=str(err)) from err
         except (ValueError, RuntimeError) as err:

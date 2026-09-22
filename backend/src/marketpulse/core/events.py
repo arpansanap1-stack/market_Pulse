@@ -29,10 +29,15 @@ class Side(StrEnum):
 
 
 class OrderType(StrEnum):
-    """Order type: LIMIT or MARKET."""
+    """Order type: active or synthetic trigger."""
 
     LIMIT = "LIMIT"
     MARKET = "MARKET"
+    STOP_LOSS = "STOP_LOSS"
+    STOP_LIMIT = "STOP_LIMIT"
+    TAKE_PROFIT = "TAKE_PROFIT"
+    TAKE_PROFIT_LIMIT = "TAKE_PROFIT_LIMIT"
+    TRAILING_STOP = "TRAILING_STOP"
 
 
 class TimeInForce(StrEnum):
@@ -64,6 +69,7 @@ class EventType(StrEnum):
     TRADE_EXECUTED = "TRADE_EXECUTED"
     BOOK_DELTA = "BOOK_DELTA"
     MARKET_EVENT = "MARKET_EVENT"
+    ORDER_TRIGGERED = "ORDER_TRIGGERED"
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -151,6 +157,9 @@ class OrderSubmitted(Event):
     tif: TimeInForce = TimeInForce.GTC
     participant_id: str = ""
     stp: STPPolicy = STPPolicy.CANCEL_NEWEST
+    stop_price_ticks: int | None = None
+    trail_offset_ticks: int | None = None
+    oco_group_id: str | None = None
 
     def __post_init__(self) -> None:
         Event._validate_base(self)
@@ -167,6 +176,27 @@ class OrderSubmitted(Event):
             and self.price_ticks != 0
         ):
             raise ValueError(f"MARKET order price_ticks must be None or 0, got {self.price_ticks}")
+        elif self.order_type in (OrderType.STOP_LOSS, OrderType.TAKE_PROFIT):
+            if self.stop_price_ticks is None or self.stop_price_ticks <= 0:
+                raise ValueError(
+                    f"{self.order_type} requires stop_price_ticks > 0, got {self.stop_price_ticks}"
+                )
+        elif self.order_type in (OrderType.STOP_LIMIT, OrderType.TAKE_PROFIT_LIMIT):
+            if self.stop_price_ticks is None or self.stop_price_ticks <= 0:
+                raise ValueError(
+                    f"{self.order_type} requires stop_price_ticks > 0, got {self.stop_price_ticks}"
+                )
+            if self.price_ticks is None or self.price_ticks <= 0:
+                raise ValueError(
+                    f"{self.order_type} requires limit price_ticks > 0, got {self.price_ticks}"
+                )
+        elif (
+            self.order_type == OrderType.TRAILING_STOP
+            and (self.trail_offset_ticks is None or self.trail_offset_ticks <= 0)
+        ):
+            raise ValueError(
+                f"TRAILING_STOP requires trail_offset_ticks > 0, got {self.trail_offset_ticks}"
+            )
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -275,6 +305,30 @@ class MarketEvent(Event):
             raise ValueError("kind must be non-empty")
 
 
+@dataclass(slots=True, frozen=True, kw_only=True)
+class OrderTriggered(Event):
+    """Emitted when a synthetic trigger condition is met (Stop, Take-Profit, Trailing Stop)."""
+
+    event_type: ClassVar[EventType] = EventType.ORDER_TRIGGERED
+
+    parent_order_id: str
+    triggered_order_id: str
+    order_type: OrderType
+    trigger_price_ticks: int
+    execution_type: OrderType
+
+    def __post_init__(self) -> None:
+        Event._validate_base(self)
+        if not self.parent_order_id:
+            raise ValueError("parent_order_id must be non-empty")
+        if not self.triggered_order_id:
+            raise ValueError("triggered_order_id must be non-empty")
+        if self.trigger_price_ticks <= 0:
+            raise ValueError(
+                f"trigger_price_ticks must be positive, got {self.trigger_price_ticks}"
+            )
+
+
 # Registry mapping EventType -> Event class for deserialization
 _EVENT_TYPE_MAP: dict[EventType, type[Event]] = {
     EventType.SESSION_STARTED: SessionStarted,
@@ -286,6 +340,7 @@ _EVENT_TYPE_MAP: dict[EventType, type[Event]] = {
     EventType.TRADE_EXECUTED: TradeExecuted,
     EventType.BOOK_DELTA: BookDelta,
     EventType.MARKET_EVENT: MarketEvent,
+    EventType.ORDER_TRIGGERED: OrderTriggered,
 }
 
 
@@ -323,6 +378,8 @@ def event_from_dict(data: Mapping[str, Any]) -> Event:
         kwargs["aggressor_side"] = Side(kwargs["aggressor_side"])
     if "order_type" in kwargs and isinstance(kwargs["order_type"], str):
         kwargs["order_type"] = OrderType(kwargs["order_type"])
+    if "execution_type" in kwargs and isinstance(kwargs["execution_type"], str):
+        kwargs["execution_type"] = OrderType(kwargs["execution_type"])
     if "tif" in kwargs and isinstance(kwargs["tif"], str):
         kwargs["tif"] = TimeInForce(kwargs["tif"])
     if "stp" in kwargs and isinstance(kwargs["stp"], str):

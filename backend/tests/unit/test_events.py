@@ -204,8 +204,29 @@ st_order_id = st.text(
 @st.composite
 def strategy_order_submitted(draw: st.DrawFn) -> OrderSubmitted:
     order_type = draw(st.sampled_from(list(OrderType)))
+    is_limit = order_type in (
+        OrderType.LIMIT,
+        OrderType.STOP_LIMIT,
+        OrderType.TAKE_PROFIT_LIMIT,
+    )
     price_ticks = (
-        draw(st.integers(min_value=1, max_value=500_000)) if order_type == OrderType.LIMIT else None
+        draw(st.integers(min_value=1, max_value=500_000)) if is_limit else None
+    )
+    stop_types = (
+        OrderType.STOP_LOSS,
+        OrderType.STOP_LIMIT,
+        OrderType.TAKE_PROFIT,
+        OrderType.TAKE_PROFIT_LIMIT,
+    )
+    stop_price_ticks = (
+        draw(st.integers(min_value=1, max_value=500_000))
+        if order_type in stop_types
+        else None
+    )
+    trail_offset_ticks = (
+        draw(st.integers(min_value=1, max_value=50_000))
+        if order_type == OrderType.TRAILING_STOP
+        else None
     )
     return OrderSubmitted(
         seq=draw(st_seq),
@@ -217,6 +238,8 @@ def strategy_order_submitted(draw: st.DrawFn) -> OrderSubmitted:
         price_ticks=price_ticks,
         qty=draw(st.integers(min_value=1, max_value=10_000)),
         tif=draw(st.sampled_from(list(TimeInForce))),
+        stop_price_ticks=stop_price_ticks,
+        trail_offset_ticks=trail_offset_ticks,
     )
 
 
@@ -359,3 +382,57 @@ def test_event_deserialization_error_handling() -> None:
 
     with pytest.raises(ValueError, match="Expected JSON object"):
         event_from_json('["not", "a", "dict"]')
+
+
+def test_order_triggered_event() -> None:
+    """Verify OrderTriggered roundtrip serialization and validation."""
+    from marketpulse.core.events import OrderTriggered
+
+    trig = OrderTriggered(
+        seq=10,
+        ts_ns=1_000_000_000,
+        symbol="AAPL",
+        parent_order_id="stop_123",
+        triggered_order_id="stop_123",
+        order_type=OrderType.STOP_LOSS,
+        trigger_price_ticks=14500,
+        execution_type=OrderType.MARKET,
+    )
+    d = trig.to_dict()
+    assert d["type"] == "ORDER_TRIGGERED"
+    assert d["parent_order_id"] == "stop_123"
+    assert d["trigger_price_ticks"] == 14500
+    assert d["execution_type"] == "MARKET"
+
+    # JSON roundtrip
+    restored = event_from_json(trig.to_json())
+    assert isinstance(restored, OrderTriggered)
+    assert restored.parent_order_id == trig.parent_order_id
+    assert restored.trigger_price_ticks == 14500
+    assert restored.execution_type == OrderType.MARKET
+
+    # Validation errors
+    with pytest.raises(ValueError, match="parent_order_id must be non-empty"):
+        OrderTriggered(
+            seq=11,
+            ts_ns=0,
+            symbol="AAPL",
+            parent_order_id="",
+            triggered_order_id="stop_123",
+            order_type=OrderType.STOP_LOSS,
+            trigger_price_ticks=14500,
+            execution_type=OrderType.MARKET,
+        )
+
+    with pytest.raises(ValueError, match="trigger_price_ticks must be positive"):
+        OrderTriggered(
+            seq=12,
+            ts_ns=0,
+            symbol="AAPL",
+            parent_order_id="p1",
+            triggered_order_id="stop_123",
+            order_type=OrderType.STOP_LOSS,
+            trigger_price_ticks=-10,
+            execution_type=OrderType.MARKET,
+        )
+

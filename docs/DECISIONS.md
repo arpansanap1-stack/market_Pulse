@@ -220,6 +220,37 @@ This document records the key architectural and design decisions made throughout
   - Hard error / Order Rejection at submission: Infeasible because whether an order will cross a self-resting order depends on market state and book price levels at matching time.
   - Post-trade wash trade detection only: Still creates dirty market data, erroneous price prints, and commission/cash balance deductions. Real-time pre-match STP prevents execution entirely.
 
+---
+
+## ADR-017: Synthetic Order Types (Stop-Loss, Take-Profit, Trailing Stops & OCO) via OMS Trigger Book
+
+- **Status:** Accepted
+- **Date:** 2026-09-22
+- **Context:**
+  - Standard financial continuous double-auction matching engines (e.g. CME, NASDAQ, LSE) strictly accept active `LIMIT` and `MARKET` orders governed by price-time priority.
+  - Complex risk management orders—such as Stop-Loss, Stop-Limit, Take-Profit, Trailing Stops, and One-Cancels-the-Other (OCO) brackets—are synthetic trigger orders traditionally managed in the broker/exchange Order Management System (OMS) layer outside the core continuous double-auction book.
+- **Decision:**
+  - Extended `OrderType` enum in `marketpulse.core.events` with synthetic types: `STOP_LOSS`, `STOP_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`, `TRAILING_STOP`.
+  - Added `EventType.ORDER_TRIGGERED` and `OrderTriggered` event class to represent activation transitions.
+  - Enforced separation of concerns: The continuous double-auction matching engine (`MatchingEngine`) remains pure and unmodified.
+  - Created pure domain `AdvancedOrderManager` in `marketpulse.core.advanced_orders`:
+    - Maintains an in-memory trigger book of `TriggerOrder` instances.
+    - Evaluates trade prints via `on_trade(price_ticks, ts_ns)`.
+    - Handles dynamic high/low watermarks and ratcheting for trailing stops.
+    - Converts activated triggers into active `OrderSubmitted` (MARKET IOC or LIMIT GTC) and emits `OrderTriggered`.
+    - Coordinates OCO groups: when an order triggers or fills, peer orders in the OCO group are automatically canceled.
+  - Updated `PortfolioTracker`:
+    - Added `OrderStatus.UNTRIGGERED` and `OrderStatus.TRIGGERED`.
+    - Tracks `stop_price_ticks`, `trail_offset_ticks`, `oco_group_id`, `current_stop_ticks`.
+    - Displays working untriggered orders in open orders query.
+  - Integrated into API and `SimulationRunner`:
+    - Added atomic OCO endpoint `POST /api/v1/orders/oco` with rollback on partial validation failure.
+    - Routed untriggered orders to `AdvancedOrderManager`, with cancellations propagating to companion orders.
+- **Alternatives Considered:**
+  - Embedding triggers inside `MatchingEngine`: Violates exchange microstructure separation of concerns, complicates price-time priority queues, and risks performance degradation in the inner continuous auction loop.
+  - Client-side polling / browser-triggered orders: Fragile, high latency, susceptible to browser disconnects, and non-deterministic across clients. Server-side OMS trigger management ensures deterministic evaluation and nanosecond-level responsiveness.
+
+
 
 
 

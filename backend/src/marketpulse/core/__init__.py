@@ -3,6 +3,7 @@
 Contains zero external I/O, database, or web framework dependencies.
 """
 
+from marketpulse.core.advanced_orders import AdvancedOrderManager, TriggerOrder
 from marketpulse.core.anomaly import (
     AnomalySeverity,
     AnomalyType,
@@ -19,6 +20,7 @@ from marketpulse.core.events import (
     OrderCanceled,
     OrderRejected,
     OrderSubmitted,
+    OrderTriggered,
     OrderType,
     SessionEnded,
     SessionStarted,
@@ -78,6 +80,7 @@ from marketpulse.core.scenarios import (
 __all__ = [
     "INTERVAL_TO_NS",
     "SCENARIO_CATALOG",
+    "AdvancedOrderManager",
     "AnomalySeverity",
     "AnomalyType",
     "Bar",
@@ -99,6 +102,7 @@ __all__ = [
     "OrderRejected",
     "OrderStatus",
     "OrderSubmitted",
+    "OrderTriggered",
     "OrderType",
     "PortfolioTracker",
     "Position",
@@ -121,6 +125,7 @@ __all__ = [
     "StreamingVolumeTrend",
     "TimeInForce",
     "TradeExecuted",
+    "TriggerOrder",
     "WallClock",
     "batch_bollinger_bands",
     "batch_ema",

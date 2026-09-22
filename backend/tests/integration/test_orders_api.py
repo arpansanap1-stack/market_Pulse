@@ -330,3 +330,106 @@ def test_order_stp_cancel_oldest_via_api(client: TestClient) -> None:
     assert status_res.status_code == 200
     stp_stats = status_res.json()["stp_stats"]
     assert stp_stats["cancel_oldest"] >= 1
+
+
+def test_synthetic_order_submission_and_cancellation(client: TestClient) -> None:
+    """Verify STOP_LOSS and TRAILING_STOP submission, UNTRIGGERED status, and cancellation."""
+    # 1. Start live session
+    client.post("/api/v1/sessions", json={"trades_per_sec": 10.0, "initial_price": 150.0})
+
+    # 2. Submit Stop-Loss order
+    res = client.post(
+        "/api/v1/orders",
+        json={
+            "symbol": "AAPL",
+            "side": "SELL",
+            "order_type": "STOP_LOSS",
+            "stop_price": 140.0,
+            "qty": 50,
+        },
+    )
+    assert res.status_code == 200
+    order_data = res.json()
+    assert order_data["status"] == "UNTRIGGERED"
+    assert order_data["stop_price"] == 140.0
+    order_id = order_data["order_id"]
+
+    # 3. Appears in open orders
+    open_orders = client.get("/api/v1/orders?status=open").json()
+    assert any(o["order_id"] == order_id for o in open_orders)
+
+    # 4. Cancel untriggered order
+    del_res = client.delete(f"/api/v1/orders/{order_id}")
+    assert del_res.status_code == 200
+    assert del_res.json()["status"] == "CANCELED"
+
+    # 5. No longer in open orders
+    open_orders_after = client.get("/api/v1/orders?status=open").json()
+    assert not any(o["order_id"] == order_id for o in open_orders_after)
+
+
+def test_atomic_oco_order_submission_and_cancel(client: TestClient) -> None:
+    """Verify POST /api/v1/orders/oco atomic submission and peer cancellation."""
+    client.post("/api/v1/sessions", json={"trades_per_sec": 10.0, "initial_price": 150.0})
+
+    oco_payload = {
+        "order_a": {
+            "symbol": "AAPL",
+            "side": "SELL",
+            "order_type": "TAKE_PROFIT",
+            "stop_price": 165.0,
+            "qty": 100,
+        },
+        "order_b": {
+            "symbol": "AAPL",
+            "side": "SELL",
+            "order_type": "STOP_LOSS",
+            "stop_price": 140.0,
+            "qty": 100,
+        },
+    }
+    res = client.post("/api/v1/orders/oco", json=oco_payload)
+    assert res.status_code == 200
+    data = res.json()
+    assert "oco_group_id" in data
+    order_a = data["order_a"]
+    order_b = data["order_b"]
+    assert order_a["oco_group_id"] == data["oco_group_id"]
+    assert order_b["oco_group_id"] == data["oco_group_id"]
+    assert order_a["status"] == "UNTRIGGERED"
+    assert order_b["status"] == "UNTRIGGERED"
+
+    # Cancel order_a -> order_b should also be canceled
+    cancel_res = client.delete(f"/api/v1/orders/{order_a['order_id']}")
+    assert cancel_res.status_code == 200
+
+    b_check = client.get(f"/api/v1/orders/{order_b['order_id']}").json()
+    assert b_check["status"] == "CANCELED"
+
+
+def test_oco_validation_rollback(client: TestClient) -> None:
+    """Verify failed second order rolls back first order."""
+    client.post("/api/v1/sessions", json={"trades_per_sec": 10.0, "initial_price": 150.0})
+
+    invalid_oco = {
+        "order_a": {
+            "symbol": "AAPL",
+            "side": "SELL",
+            "order_type": "STOP_LOSS",
+            "stop_price": 140.0,
+            "qty": 100,
+        },
+        "order_b": {
+            "symbol": "AAPL",
+            "side": "SELL",
+            "order_type": "LIMIT",
+            # Missing required price
+            "qty": 100,
+        },
+    }
+    res = client.post("/api/v1/orders/oco", json=invalid_oco)
+    assert res.status_code == 400
+    # No open orders should remain
+    open_orders = client.get("/api/v1/orders?status=open").json()
+    assert len(open_orders) == 0
+

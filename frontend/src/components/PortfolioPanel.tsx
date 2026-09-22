@@ -412,7 +412,8 @@ export const PortfolioPanel: React.FC<PortfolioPanelProps> = ({
                     <th className="pb-1.5 font-medium">Symbol</th>
                     <th className="pb-1.5 font-medium">Side</th>
                     <th className="pb-1.5 font-medium">Type</th>
-                    <th className="pb-1.5 font-medium text-right">Price</th>
+                    <th className="pb-1.5 font-medium">Status</th>
+                    <th className="pb-1.5 font-medium text-right">Price / Trigger</th>
                     <th className="pb-1.5 font-medium text-right">Qty</th>
                     <th className="pb-1.5 font-medium text-right">Filled</th>
                     <th className="pb-1.5 font-medium text-center">TIF</th>
@@ -424,8 +425,15 @@ export const PortfolioPanel: React.FC<PortfolioPanelProps> = ({
                     const isBuy = order.side === 'BUY';
                     return (
                       <tr key={order.order_id} className="hover:bg-slate-800/40 transition-colors">
-                        <td className="py-2 text-slate-400 text-[11px] font-mono">
-                          {order.order_id}
+                        <td className="py-2 text-slate-300 text-[11px] font-mono">
+                          <div className="flex flex-col">
+                            <span>{order.order_id}</span>
+                            {order.oco_group_id && (
+                              <span className="text-[9px] font-mono text-cyan-400 bg-cyan-950/60 px-1 rounded border border-cyan-800/40 w-fit mt-0.5">
+                                OCO: {order.oco_group_id.slice(0, 8)}
+                              </span>
+                            )}
+                          </div>
                         </td>
                         <td className="py-2 font-bold text-slate-200">{order.symbol}</td>
                         <td className="py-2">
@@ -439,9 +447,60 @@ export const PortfolioPanel: React.FC<PortfolioPanelProps> = ({
                             {order.side}
                           </span>
                         </td>
-                        <td className="py-2 text-slate-300">{order.order_type}</td>
-                        <td className="py-2 text-right font-semibold text-slate-200">
-                          {order.price ? `$${order.price.toFixed(2)}` : 'MKT'}
+                        <td className="py-2 text-slate-300 text-[11px]">
+                          {order.order_type.replace('_', ' ')}
+                        </td>
+                        <td className="py-2">
+                          {order.status === 'UNTRIGGERED' ? (
+                            <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-950/60 text-amber-400 border border-amber-800/50">
+                              WORKING TRIGGER
+                            </span>
+                          ) : order.status === 'TRIGGERED' ? (
+                            <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-950/60 text-blue-400 border border-blue-800/50">
+                              TRIGGERED
+                            </span>
+                          ) : (
+                            <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-300 border border-slate-700">
+                              {order.status}
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2 text-right">
+                          {order.order_type === 'STOP_LOSS' && (
+                            <span className="text-rose-400 font-semibold text-[11px]">
+                              Stop ${order.stop_price?.toFixed(2)} → MKT
+                            </span>
+                          )}
+                          {order.order_type === 'STOP_LIMIT' && (
+                            <span className="text-amber-400 font-semibold text-[11px]">
+                              Stop ${order.stop_price?.toFixed(2)} | Lmt ${order.price?.toFixed(2)}
+                            </span>
+                          )}
+                          {order.order_type === 'TAKE_PROFIT' && (
+                            <span className="text-emerald-400 font-semibold text-[11px]">
+                              TP ${order.stop_price?.toFixed(2)} → MKT
+                            </span>
+                          )}
+                          {order.order_type === 'TAKE_PROFIT_LIMIT' && (
+                            <span className="text-emerald-400 font-semibold text-[11px]">
+                              TP ${order.stop_price?.toFixed(2)} | Lmt ${order.price?.toFixed(2)}
+                            </span>
+                          )}
+                          {order.order_type === 'TRAILING_STOP' && (
+                            <div className="flex flex-col text-right">
+                              <span className="text-cyan-400 font-semibold text-[11px]">
+                                Trail ${order.trail_offset?.toFixed(2)}
+                              </span>
+                              <span className="text-[10px] text-slate-400">
+                                Stop: ${order.current_stop ? order.current_stop.toFixed(2) : 'calc...'}
+                              </span>
+                            </div>
+                          )}
+                          {(order.order_type === 'LIMIT' || order.order_type === 'MARKET') && (
+                            <span className="font-semibold text-slate-200">
+                              {order.price ? `$${order.price.toFixed(2)}` : 'MKT'}
+                            </span>
+                          )}
                         </td>
                         <td className="py-2 text-right text-slate-200">{order.qty}</td>
                         <td className="py-2 text-right text-slate-400">{order.filled_qty}</td>

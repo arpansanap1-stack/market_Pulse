@@ -12,9 +12,18 @@ export type OrderStatus =
   | 'PARTIALLY_FILLED'
   | 'FILLED'
   | 'CANCELED'
-  | 'REJECTED';
+  | 'REJECTED'
+  | 'UNTRIGGERED'
+  | 'TRIGGERED';
 
-export type OrderType = 'LIMIT' | 'MARKET';
+export type OrderType =
+  | 'LIMIT'
+  | 'MARKET'
+  | 'STOP_LOSS'
+  | 'STOP_LIMIT'
+  | 'TAKE_PROFIT'
+  | 'TAKE_PROFIT_LIMIT'
+  | 'TRAILING_STOP';
 
 export type TimeInForce = 'GTC' | 'IOC' | 'FOK';
 
@@ -38,6 +47,13 @@ export interface OrderRecord {
   rejection_reason?: string | null;
   participant_id?: string;
   stp?: STPPolicy;
+  stop_price?: number | null;
+  stop_price_ticks?: number | null;
+  trail_offset?: number | null;
+  trail_offset_ticks?: number | null;
+  oco_group_id?: string | null;
+  current_stop?: number | null;
+  current_stop_ticks?: number | null;
 }
 
 export interface PositionItem {
@@ -93,4 +109,12 @@ export interface OrderSubmitPayload {
   tif?: TimeInForce;
   participant_id?: string;
   stp?: STPPolicy;
+  stop_price?: number | null;
+  trail_offset?: number | null;
+  oco_group_id?: string | null;
+}
+
+export interface OCOSubmitPayload {
+  order_a: OrderSubmitPayload;
+  order_b: OrderSubmitPayload;
 }
